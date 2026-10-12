@@ -1,0 +1,307 @@
+#!/usr/bin/env python3
+"""crc -- keep Claude Code remote-control sessions running across reboots.
+
+    crc new [DIR] [--name N] [-i] [-- ARGS]
+                                        start `claude rc` in DIR and keep it;
+                                        -i: a terminal `claude --remote-control`
+    crc adopt [DIR] [--pid N]           keep a session already running in DIR
+    crc ls                              show kept sessions and their state
+    crc restore                         bring back every kept session (boot)
+    crc attach                          attach to the tmux session hosting them
+    crc rm DIR [--keep-registration]    stop keeping DIR, stop it, release it
+    crc release [DIR] [--force]         release a dead host's stale registration
+    crc doctor                          check what restore depends on
+
+Kept sessions run in windows of a private tmux server (`tmux -L crc`), which
+the claude-rc-keeper user unit owns. After a reboot the unit resumes each one:
+an rc host with `claude rc --session-id`, first releasing any registration a
+dead host left on the folder (the "This folder is already served" error); a
+terminal session with `claude --resume <conversation> --remote-control`, which
+keeps its claude.ai link.
+"""
+import argparse
+import os
+import shutil
+import subprocess
+import sys
+import time
+
+LIBDIR = os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "lib")
+sys.path.insert(0, LIBDIR)
+import bridge                    # noqa: E402
+import keeper                    # noqa: E402
+import tmuxctl                   # noqa: E402
+
+
+def die(msg, code=1):
+    print(f"crc: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def folder(arg):
+    return os.path.realpath(arg or os.getcwd())
+
+
+def cmd_new(a):
+    d = folder(a.dir)
+    if not os.path.isdir(d):
+        die(f"{d} is not a directory")
+    entries = keeper.load()
+    w = tmuxctl.window_for(d)
+    if d in entries and w is not None and not w.dead:
+        die(f"{d} is already kept and running; `crc attach` to see it")
+    p = bridge.read_pointer(d)
+    if p is not None and bridge.host_alive(p):
+        die(f"a claude rc (pid {p.pid}, session {p.session_id}) is already "
+            f"serving {d}; `crc adopt` keeps it instead")
+    name = a.name or os.path.basename(d) or d
+    if a.interactive:
+        argv = ["claude", "--remote-control", *([a.name] if a.name else []), *a.args]
+        confirm = keeper.interactive_started
+    else:
+        argv = ["claude", "rc", *(["--name", a.name] if a.name else []), *a.args]
+        confirm = keeper.rc_started(d)
+    wid, r, err = keeper.start(d, name, argv, confirm)
+    if err is not None:
+        die(f"{argv[0]} {argv[1]} did not start in {d}:\n{err}\n(window {wid} "
+            f"left open in `crc attach` for a closer look)")
+    e = {"name": name, "args": a.args, "added": keeper.now(),
+         "updated": keeper.now(), "last_status": "running", "last_error": None}
+    if a.interactive:
+        e.update(kind="interactive", session_id=r.bridge_session_id,
+                 transcript_id=r.transcript_id)
+    else:
+        e.update(kind="rc", session_id=r.session_id, environment_id=r.environment_id)
+    entries[d] = e
+    keeper.save(entries)
+    print(f"keeping {d}\n  session {e['session_id']}\n  window  {wid} (crc attach)")
+
+
+def cmd_adopt(a):
+    """Prefer a `claude rc` host; otherwise a terminal session with remote
+    control on. A folder can have both, but only one entry, and the rc host is
+    the one the server ties to the folder."""
+    d = folder(a.dir)
+    e = {"name": os.path.basename(d) or d, "args": [], "added": keeper.now(),
+         "updated": keeper.now(), "last_status": "elsewhere", "last_error": None}
+    p = bridge.read_pointer(d)
+    if a.pid is None and p is not None and bridge.host_alive(p):
+        e.update(kind="rc", session_id=p.session_id, environment_id=p.environment_id)
+        pid = p.pid
+    else:
+        found = keeper.interactive_in(d, bridge.live_sessions())
+        if a.pid is not None:
+            found = [s for s in found if s.pid == a.pid]
+        if not found:
+            die(f"no running claude rc, and no terminal claude with remote control "
+                f"on, in {d}" + (f" with pid {a.pid}" if a.pid else ""))
+        if len(found) > 1:
+            die(f"several sessions in {d}; pick one with --pid: "
+                + ", ".join(f"{s.pid} ({s.bridge_session_id})" for s in found))
+        s = found[0]
+        e.update(kind="interactive", session_id=s.bridge_session_id,
+                 transcript_id=s.transcript_id)
+        pid = s.pid
+    entries = keeper.load()
+    entries[d] = e
+    keeper.save(entries)
+    print(f"keeping {d} ({e['kind']}, session {e['session_id']})\n"
+          f"It stays where it is (pid {pid}) until it exits; from the next "
+          f"restore on it runs under crc.")
+
+
+def cmd_ls(a):
+    entries = keeper.load()
+    if not entries:
+        print("nothing kept; add a folder with `crc new` or `crc adopt`")
+        return
+    for d, e in sorted(entries.items()):
+        action, detail = keeper.state_of(d, e)
+        state = {keeper.RUNNING: f"running ({detail})",
+                 keeper.ELSEWHERE: f"running outside crc (pid {detail})",
+                 keeper.OCCUPIED: f"blocked: another live host (pid {detail})",
+                 keeper.RELEASE: f"stopped; stale registration {detail} to release",
+                 keeper.LAUNCH: "stopped"}[action]
+        print(f"{e.get('name', '?'):20} {state}\n{'':20} {d}\n"
+              f"{'':20} {keeper.kind(e)} {e['session_id']}")
+        if action not in (keeper.RUNNING, keeper.ELSEWHERE) and e.get("last_error"):
+            last = e["last_error"].splitlines()[-1]
+            print(f"{'':20} last attempt: {e.get('last_status')}: {last}")
+
+
+def cmd_restore(a):
+    entries = keeper.load()
+    if not entries:
+        return 0
+    if not a.no_wait and not keeper.wait_network():
+        print("network still unreachable; trying anyway", file=sys.stderr)
+    ok = True
+    for d, e in sorted(entries.items()):
+        if not os.path.isdir(d):
+            print(f"{d}: folder missing (unmounted?); skipped")
+            e["last_status"], e["last_error"] = "failed", "folder missing"
+            ok = False
+            continue
+        ok &= keeper.restore_one(d, e)
+        keeper.save(entries)
+    return 0 if ok else 1
+
+
+def cmd_attach(a):
+    if not tmuxctl.session_up():
+        die("no crc tmux session; `crc restore` or `crc new` starts one")
+    env = {k: v for k, v in os.environ.items() if k != "TMUX"}
+    os.execvpe("tmux", ["tmux", "-L", tmuxctl.SOCKET, "attach", "-t",
+                        f"={tmuxctl.SESSION}"], env)
+
+
+def stop_window(w, interactive=False):
+    """Exit the way it would in a terminal: Ctrl-C for an rc host; for a
+    terminal session, Escape (abandon any turn in progress) then /exit."""
+    if interactive:
+        tmuxctl.tmux("send-keys", "-t", w.id, "Escape", check=False)
+        time.sleep(0.5)
+        tmuxctl.tmux("send-keys", "-t", w.id, "/exit", "Enter", check=False)
+    else:
+        tmuxctl.interrupt(w.id)
+    for _ in range(20):
+        time.sleep(0.5)
+        cur = tmuxctl.get(w.id)
+        if cur is None or cur.dead:
+            break
+    tmuxctl.kill(w.id)
+
+
+def cmd_rm(a):
+    d = folder(a.dir)
+    entries = keeper.load()
+    e = entries.pop(d, None)
+    if e is None:
+        die(f"{d} is not kept")
+    w = tmuxctl.window_for(d)
+    if w is not None:
+        stop_window(w, keeper.kind(e) == "interactive")
+    keeper.save(entries)
+    print(f"stopped keeping {d}")
+    if keeper.kind(e) == "interactive":
+        return              # registers no environment, so nothing to release
+    p = bridge.read_pointer(d)
+    if p is not None and bridge.host_alive(p):
+        print(f"claude rc pid {p.pid} is still running outside crc; left alone")
+        return
+    if a.keep_registration:
+        return
+    # Ctrl-C keeps the registration for `claude rc -c`. Leaving it would block
+    # the next `claude rc` in this folder, which is the problem crc exists for.
+    envs = {e.get("environment_id")} | ({p.environment_id} if p else set())
+    for env in sorted(x for x in envs if x):
+        try:
+            keeper.release(env, p)
+            print(f"released {env}")
+        except bridge.BridgeError as err:
+            print(f"could not release {env}: {err}", file=sys.stderr)
+
+
+def cmd_release(a):
+    d = folder(a.dir)
+    p = bridge.read_pointer(d)
+    if p is None:
+        die(f"no bridge pointer for {d}; nothing recorded to release")
+    if bridge.host_alive(p):
+        die(f"its host is still running (pid {p.pid}); stop it first")
+    e = keeper.load().get(d)
+    if e and p.environment_id == e.get("environment_id") and not a.force:
+        die(f"{p.environment_id} is the environment of the kept session; resuming "
+            f"reuses it, so releasing it is not needed. --force to release anyway")
+    try:
+        keeper.release(p.environment_id, p)
+    except bridge.BridgeError as err:
+        die(str(err))
+    print(f"released {p.environment_id} (session {p.session_id})")
+
+
+def cmd_doctor(a):
+    ok = True
+
+    def check(label, good, hint=""):
+        nonlocal ok
+        ok &= bool(good)
+        print(f"{'ok  ' if good else 'FAIL'} {label}" + ("" if good else f"\n     {hint}"))
+
+    check("claude on PATH", shutil.which("claude"), "install Claude Code")
+    check("tmux on PATH", shutil.which("tmux"), "pacman -S tmux")
+    try:
+        bridge.access_token()
+        check("Claude Code login token readable and current", True)
+    except bridge.BridgeError as e:
+        check("Claude Code login token readable and current", False, str(e))
+    check("api.anthropic.com reachable", keeper.wait_network(timeout=5),
+          "restore waits up to 2 minutes for the network at boot")
+    check(f"{tmuxctl.UNIT} installed", tmuxctl.unit_installed(),
+          "make install, then systemctl --user daemon-reload")
+    en = subprocess.run(["systemctl", "--user", "is-enabled", tmuxctl.UNIT],
+                        capture_output=True, text=True).stdout.strip()
+    check(f"{tmuxctl.UNIT} enabled", en == "enabled",
+          f"systemctl --user enable {tmuxctl.UNIT}")
+    linger = subprocess.run(["loginctl", "show-user", os.environ.get("USER", ""),
+                             "-p", "Linger", "--value"],
+                            capture_output=True, text=True).stdout.strip()
+    check("lingering on (restore at boot, before login)", linger == "yes",
+          "loginctl enable-linger  (without it, restore waits for your login)")
+    return 0 if ok else 1
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="crc", description=__doc__.split("\n\n")[0],
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    s = sub.add_parser("new", help="start claude rc in a folder and keep it")
+    s.add_argument("dir", nargs="?")
+    s.add_argument("--name", help="session name shown in claude.ai/code")
+    s.add_argument("-i", "--interactive", action="store_true",
+                   help="a terminal session with remote control, not a claude rc host")
+    s.set_defaults(fn=cmd_new)
+
+    s = sub.add_parser("adopt", help="keep a session already running here")
+    s.add_argument("dir", nargs="?")
+    s.add_argument("--pid", type=int, help="which terminal session, if several")
+    s.set_defaults(fn=cmd_adopt)
+
+    sub.add_parser("ls", help="show kept sessions").set_defaults(fn=cmd_ls)
+
+    s = sub.add_parser("restore", help="bring back every kept session")
+    s.add_argument("--no-wait", action="store_true", help="skip waiting for the network")
+    s.set_defaults(fn=cmd_restore)
+
+    sub.add_parser("attach", help="attach to the crc tmux session").set_defaults(fn=cmd_attach)
+
+    s = sub.add_parser("rm", help="stop keeping a folder")
+    s.add_argument("dir")
+    s.add_argument("--keep-registration", action="store_true",
+                   help="leave the server registration in place")
+    s.set_defaults(fn=cmd_rm)
+
+    s = sub.add_parser("release", help="release a dead host's stale registration")
+    s.add_argument("dir", nargs="?")
+    s.add_argument("--force", action="store_true")
+    s.set_defaults(fn=cmd_release)
+
+    sub.add_parser("doctor", help="check prerequisites").set_defaults(fn=cmd_doctor)
+
+    # Split by hand: with an optional DIR positional, argparse would take the
+    # first passthrough flag after `--` as DIR.
+    argv = sys.argv[1:]
+    extra = []
+    if "--" in argv:
+        i = argv.index("--")
+        argv, extra = argv[:i], argv[i + 1:]
+    a = ap.parse_args(argv)
+    if extra and a.cmd != "new":
+        ap.error("only `crc new` takes extra claude rc flags after --")
+    a.args = extra
+    sys.exit(a.fn(a) or 0)
+
+
+if __name__ == "__main__":
+    main()
