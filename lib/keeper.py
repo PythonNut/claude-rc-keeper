@@ -35,6 +35,8 @@ ALREADY_SERVED = "already served"
 # The client's prompt in a folder it has not been told to trust; it waits for
 # a keypress, so a launch there never registers.
 TRUST_PROMPT = "Quick safety check"
+TRUST_MENU_YES = "Yes, I trust this folder"
+TRUST_DELAY = 2.0
 
 
 def state_dir():
@@ -195,11 +197,24 @@ def interactive_started(w):
     return None
 
 
-def start(directory, name, argv, confirm, timeout=60):
+def answer_trust(window_id, screen):
+    """Accept the trust prompt on screen: `claude rc` asks [y/N]; an
+    interactive `claude` shows a menu whose default is "No, exit"."""
+    if TRUST_MENU_YES in screen:
+        tmuxctl.tmux("send-keys", "-t", window_id, "Down", check=False)
+        time.sleep(0.3)
+        tmuxctl.tmux("send-keys", "-t", window_id, "Enter", check=False)
+    else:
+        tmuxctl.tmux("send-keys", "-t", window_id, "y", "Enter", check=False)
+
+
+def start(directory, name, argv, confirm, timeout=60, trust=False):
     """Launch argv in a crc window and wait until confirm(window) says it is up.
 
     Returns (window_id, result, error), where result is whatever confirm
-    returned and error is the pane's last output on failure.
+    returned and error is the pane's last output on failure. If Claude Code
+    asks whether to trust the folder, trust=True answers yes, once; otherwise
+    the launch fails at once rather than waiting out the timeout.
     """
     tmuxctl.ensure_session()
     old = tmuxctl.window_for(directory)
@@ -207,6 +222,7 @@ def start(directory, name, argv, confirm, timeout=60):
         tmuxctl.kill(old.id)
     wid = tmuxctl.launch(directory, name, argv)
     deadline = time.monotonic() + timeout
+    answered = seen = None
     while time.monotonic() < deadline:
         time.sleep(0.5)
         w = tmuxctl.get(wid)
@@ -217,11 +233,27 @@ def start(directory, name, argv, confirm, timeout=60):
         r = confirm(w)
         if r is not None:
             return wid, r, None
-        if TRUST_PROMPT in tmuxctl.capture(wid, lines=15):
-            # Whether to trust a folder is the user's call, not ours.
-            tmuxctl.kill(wid)
-            return wid, None, (f"Claude Code asks whether to trust {directory}; "
-                               f"run `claude` there once and accept, then retry")
+        screen = tmuxctl.capture(wid, lines=20)
+        if TRUST_PROMPT not in screen:
+            continue
+        if trust and answered is None:
+            # The client ignores an answer that comes too soon after the
+            # question (keys typed ahead of it), so let it sit a moment.
+            seen = seen or time.monotonic()
+            if time.monotonic() - seen >= TRUST_DELAY:
+                answer_trust(wid, screen)
+                answered = time.monotonic()
+            continue
+        if answered is not None and time.monotonic() - answered < 5:
+            continue                    # give the answer time to take
+        # Whether to trust a folder is the user's call: only with trust=True
+        # (crc new/move --trust) do we answer for them.
+        tmuxctl.kill(wid)
+        if answered is not None:
+            return wid, None, f"answered Claude Code's trust prompt, but it stayed:\n{screen}"
+        return wid, None, (f"Claude Code asks whether to trust {directory}; pass "
+                           f"--trust to accept it, or run `claude` there once and "
+                           f"accept, then retry")
     return wid, None, f"no registration after {timeout}s:\n{tmuxctl.capture(wid)}"
 
 
@@ -332,7 +364,7 @@ def finish(directory, entry, wid, err, log):
     return False
 
 
-def restore_interactive(directory, entry, log, dry_run=False):
+def restore_interactive(directory, entry, log, dry_run=False, trust=False):
     action, detail = plan_interactive(entry, bridge.live_sessions(),
                                       tmuxctl.window_for(directory))
     if dry_run:
@@ -353,7 +385,7 @@ def restore_interactive(directory, entry, log, dry_run=False):
         return True
     log(f"{directory}: resuming conversation {entry['transcript_id']}")
     wid, s, err = start(directory, entry.get("name") or os.path.basename(directory),
-                        resume_argv(entry), interactive_started)
+                        resume_argv(entry), interactive_started, trust=trust)
     if err is None and s.bridge_session_id != entry["session_id"]:
         log(f"{directory}: came back as {s.bridge_session_id}, not "
             f"{entry['session_id']}; the claude.ai link changed")
@@ -382,12 +414,12 @@ def describe(directory, entry, action, detail, pointer, log):
         log(f"{directory}: would re-queue {sid}")
 
 
-def restore_one(directory, entry, log=print, dry_run=False):
+def restore_one(directory, entry, log=print, dry_run=False, trust=False):
     """Bring one kept folder back. Updates entry in place; returns True if it
     is running (here or elsewhere) afterwards. With dry_run, only logs what it
     would do."""
     if kind(entry) == "interactive":
-        return restore_interactive(directory, entry, log, dry_run)
+        return restore_interactive(directory, entry, log, dry_run, trust)
     pointer = bridge.read_pointer(directory)
     alive = pointer is not None and bridge.host_alive(pointer)
     action, detail = plan(entry, pointer, alive, tmuxctl.window_for(directory))
@@ -421,7 +453,7 @@ def restore_one(directory, entry, log=print, dry_run=False):
         f"{1 + len(entry.get('sessions', []))} session(s)")
     bridge.write_pointer(directory, entry["session_id"], entry["environment_id"])
     wid, p, err = start(directory, entry.get("name") or os.path.basename(directory),
-                        resume_argv(entry), rc_started(directory))
+                        resume_argv(entry), rc_started(directory), trust=trust)
     if err is None:
         if p.environment_id != entry["environment_id"]:
             # The server would not give the environment back, so nothing on it

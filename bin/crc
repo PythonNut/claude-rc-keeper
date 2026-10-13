@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """crc -- keep Claude Code remote-control sessions running across reboots.
 
-    crc new [DIR] [--name N] [-i] [-- ARGS]
+    crc new [DIR] [--name N] [-i] [--trust] [-- ARGS]
                                         start `claude rc` in DIR and keep it;
                                         -i: a terminal `claude --remote-control`
     crc adopt [DIR] [--pid N]           keep a session already running in DIR
@@ -10,7 +10,7 @@
     crc restore [--dry-run]             bring back every kept session (boot)
     crc attach                          attach to the tmux session hosting them
     crc rm DIR [--keep-registration]    stop keeping DIR, stop it, release it
-    crc move OLD NEW                    carry a kept session to a moved folder
+    crc move OLD NEW [--trust]          carry a kept session to a moved folder
     crc release [DIR] [--force]         release a dead host's stale registration
     crc stale                           list stale registrations in every folder
     crc doctor                          check what restore depends on
@@ -66,7 +66,7 @@ def cmd_new(a):
     else:
         argv = ["claude", "rc", *(["--name", a.name] if a.name else []), *a.args]
         confirm = keeper.rc_started(d)
-    wid, r, err = keeper.start(d, name, argv, confirm)
+    wid, r, err = keeper.start(d, name, argv, confirm, trust=a.trust)
     if err is not None:
         left = (f"\n(window {wid} left open in `crc attach` for a closer look)"
                 if tmuxctl.get(wid) is not None else "")
@@ -331,7 +331,7 @@ def cmd_move(a):
     entries[new] = e
     keeper.save(entries)
     env_before = e.get("environment_id")
-    ok = keeper.restore_one(new, e)
+    ok = keeper.restore_one(new, e, trust=a.trust)
     keeper.save(entries)
     if not ok:
         die(f"{new} did not come up; `crc ls` shows why and `crc restore` retries. "
@@ -468,6 +468,8 @@ def main():
     s.add_argument("--name", help="session name shown in claude.ai/code")
     s.add_argument("-i", "--interactive", action="store_true",
                    help="a terminal session with remote control, not a claude rc host")
+    s.add_argument("--trust", action="store_true",
+                   help="if Claude Code asks whether to trust the folder, answer yes")
     s.set_defaults(fn=cmd_new)
 
     s = sub.add_parser("adopt", help="keep a session already running here")
@@ -498,6 +500,8 @@ def main():
     s = sub.add_parser("move", help="carry a kept session to a moved folder")
     s.add_argument("old")
     s.add_argument("new")
+    s.add_argument("--trust", action="store_true",
+                   help="if Claude Code asks whether to trust the folder, answer yes")
     s.set_defaults(fn=cmd_move)
 
     s = sub.add_parser("release", help="release a dead host's stale registration")

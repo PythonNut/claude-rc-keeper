@@ -105,7 +105,7 @@ Without it, restore runs when you log in.
     crc attach                           look at the sessions (tmux -L crc)
     crc rm DIR                           stop keeping DIR; stops it and releases it
     crc release [DIR]                    just the stale-registration fix
-    crc move OLD NEW                     carry a kept session to a moved folder
+    crc move OLD NEW [--trust]           carry a kept session to a moved folder
     crc stale                            list stale registrations in every folder
     crc restore [--dry-run]              what the unit runs at start; --dry-run
                                          shows what it would start, re-queue and
@@ -117,6 +117,11 @@ There is one kept session per folder, because the server allows only one rc
 host per folder. `adopt` prefers an rc host and otherwise takes a terminal
 session with remote control on. An interactive session is never relaunched
 while its conversation is already open somewhere else.
+
+Claude Code asks once per folder whether to trust it, and waits for an
+answer. In a folder it hasn't been told to trust, `crc new` and `crc move`
+fail right away and say so. Pass `--trust` to have crc answer yes for you.
+`crc restore` never answers it.
 
 FLAGS after `--` are passed to `claude rc` (or `claude`, with `-i`) and reused
 on every resume. Don't pass `--spawn=session`: it makes the host
