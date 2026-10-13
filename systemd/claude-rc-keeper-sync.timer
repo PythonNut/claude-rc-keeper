@@ -1,0 +1,9 @@
+[Unit]
+Description=Record sessions on kept Claude Code remote-control hosts every few minutes
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=3min
+
+[Install]
+WantedBy=timers.target

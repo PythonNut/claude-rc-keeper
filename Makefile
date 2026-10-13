@@ -9,6 +9,7 @@ LIBDIR  ?= $(PREFIX)/lib/claude-rc-keeper
 # ~/.local default needs no extra configuration.
 UNITDIR ?= $(PREFIX)/share/systemd/user
 UNIT    := claude-rc-keeper.service
+SYNC    := claude-rc-keeper-sync
 MODULES := bridge.py keeper.py tmuxctl.py
 
 .PHONY: all test install uninstall
@@ -30,16 +31,19 @@ install:
 	@tmux_path=$$(command -v tmux || echo /usr/bin/tmux); \
 	sed -e 's|@BINDIR@|$(BINDIR)|g' -e "s|@TMUX@|$$tmux_path|g" \
 	    systemd/$(UNIT).in > $(DESTDIR)$(UNITDIR)/$(UNIT)
+	sed -e 's|@BINDIR@|$(BINDIR)|g' systemd/$(SYNC).service.in \
+	    > $(DESTDIR)$(UNITDIR)/$(SYNC).service
+	install -m 0644 systemd/$(SYNC).timer $(DESTDIR)$(UNITDIR)/$(SYNC).timer
 	@if [ -z "$(DESTDIR)" ]; then \
 	    echo; echo "installed. next:"; \
 	    echo "  systemctl --user daemon-reload"; \
-	    echo "  systemctl --user enable $(UNIT)"; \
+	    echo "  systemctl --user enable $(UNIT) $(SYNC).timer"; \
 	    echo "  crc doctor"; \
 	fi
 
 # Does not stop the unit: stopping it ends every kept session. Disable it
 # yourself first if that is what you want.
 uninstall:
-	rm -f $(BINDIR)/crc $(UNITDIR)/$(UNIT)
+	rm -f $(BINDIR)/crc $(UNITDIR)/$(UNIT) $(UNITDIR)/$(SYNC).service $(UNITDIR)/$(SYNC).timer
 	rm -rf $(LIBDIR)
 	@echo "removed. the session list in ~/.local/state/claude-rc-keeper was left in place."

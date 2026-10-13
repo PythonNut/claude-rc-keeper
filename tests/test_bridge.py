@@ -115,12 +115,56 @@ class Sessions(unittest.TestCase):
                     os.environ["CLAUDE_CONFIG_DIR"] = old
 
 
+class RestorePointer(unittest.TestCase):
+
+    def test_write_then_read_round_trips_without_pid(self):
+        with tempfile.TemporaryDirectory() as d:
+            old = os.environ.get("CLAUDE_CONFIG_DIR")
+            os.environ["CLAUDE_CONFIG_DIR"] = d
+            try:
+                bridge.write_pointer("/srv/x", "session_A", "env_E")
+                p = bridge.read_pointer("/srv/x")
+                self.assertEqual((p.session_id, p.environment_id, p.pid), ("session_A", "env_E", 0))
+                self.assertFalse(bridge.host_alive(p))
+                self.assertEqual(os.listdir(os.path.dirname(p.path)), [bridge.POINTER])
+            finally:
+                if old is None:
+                    del os.environ["CLAUDE_CONFIG_DIR"]
+                else:
+                    os.environ["CLAUDE_CONFIG_DIR"] = old
+
+
+class Ids(unittest.TestCase):
+
+    def test_canonical(self):
+        self.assertEqual(bridge.canonical("cse_01abc"), "session_01abc")
+        self.assertEqual(bridge.canonical("session_01abc"), "session_01abc")
+
+    def test_parent_pid_survives_hostile_comm(self):
+        self.assertEqual(bridge.parse_parent_pid("42 (a) b (c)) S 777 1 1"), 777)
+
+    def test_parent_of_child_is_us(self):
+        import subprocess
+        c = subprocess.Popen(["sleep", "5"])
+        try:
+            self.assertEqual(bridge.parent_pid(c.pid), os.getpid())
+        finally:
+            c.kill()
+            c.wait()
+
+
 class Deregister(unittest.TestCase):
 
     def test_refuses_malformed_id_before_any_request(self):
         for bad in ("", "env_", "env_x/../y", "session_01abc", "env_a b"):
             with self.assertRaises(bridge.BridgeError):
                 bridge.deregister(bad, token="t", base="http://127.0.0.1:9")
+
+    def test_reconnect_refuses_malformed_ids_before_any_request(self):
+        for env, sid in (("env_x/..", "session_a"), ("env_a", "session_a/../b"),
+                         ("env_a", "env_b"), ("env_a", "")):
+            with self.assertRaises(bridge.BridgeError):
+                bridge.reconnect(env, sid, token="t", base="http://127.0.0.1:9")
 
 
 if __name__ == "__main__":

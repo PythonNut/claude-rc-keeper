@@ -1,5 +1,6 @@
-"""What Claude Code records about remote-control hosts, and the one server call
-needed to clean up after a host that died.
+"""What Claude Code records about remote-control hosts, and the two server
+calls needed to bring one back: releasing what a dead host left behind, and
+re-queuing a host's sessions onto it.
 
 Everything here depends on Claude Code internals that are not a documented
 interface: the layout of ~/.claude, the bridge-pointer.json schema, the OAuth
@@ -16,6 +17,18 @@ the folder is refused with "This folder is already served ...". Nothing on the
 server expires it. The client keeps a note of the last host it ran in each
 folder, ~/.claude/projects/<key>/bridge-pointer.json, and that note is how we
 find what to release.
+
+Restoring a host with all its sessions. Sessions are bound to the environment
+they were created on; the server refuses to hand one to any other ("Session
+does not belong to this environment"). `claude rc --session-id` and `-c` do
+reuse the environment, but always in single-session mode, so a host's other
+sessions can never come back through them. A plain `claude rc`, though, reads
+the pointer, asks to reuse its environment, and stays multi-session -- and the
+server grants the reuse even for an environment that was deregistered. Once
+that host is up, POST .../bridge/reconnect on the same environment hands it
+each remaining session, the same call the client uses to adopt its own. The
+pointer only ever names one session, so the others have to be remembered by
+us (keeper.sync).
 """
 import json
 import os
@@ -65,11 +78,16 @@ def pointer_path(directory):
 
 
 def parse_pointer(text, path=""):
-    """Parse a bridge-pointer.json body, or None if it is not one we understand."""
+    """Parse a bridge-pointer.json body, or None if it is not one we understand.
+
+    pid and procStart are optional, as in the client's own schema: a pointer
+    we wrote for a restore has neither until the new host rewrites it. Such a
+    pointer reads as pid 0, which host_alive never calls alive.
+    """
     try:
         d = json.loads(text)
         return Pointer(str(d["sessionId"]), str(d["environmentId"]),
-                       int(d["pid"]), str(d["procStart"]), path)
+                       int(d.get("pid") or 0), str(d.get("procStart") or ""), path)
     except (ValueError, KeyError, TypeError):
         return None
 
@@ -81,6 +99,24 @@ def read_pointer(directory):
             return parse_pointer(f.read(), path)
     except OSError:
         return None
+
+
+def write_pointer(directory, session_id, environment_id):
+    """Point the folder at an environment, so the next plain `claude rc` there
+    asks to reuse it and adopts session_id.
+
+    Written fresh each time: the client ignores a pointer older than its TTL
+    (hours), and after a long outage the one it left would be cleared, losing
+    the environment and every session on it. No pid, so the client does not
+    mistake it for a live host.
+    """
+    path = pointer_path(directory)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = f"{path}.crc-{os.getpid()}"
+    with open(tmp, "w") as f:
+        json.dump({"sessionId": session_id, "environmentId": environment_id,
+                   "source": "standalone"}, f, separators=(",", ":"))
+    os.replace(tmp, path)
 
 
 def remove_pointer(pointer):
@@ -104,6 +140,18 @@ def parse_proc_start(stat_line):
     """
     rest = stat_line[stat_line.rindex(")") + 2:].split()
     return rest[22 - 3]
+
+
+def parse_parent_pid(stat_line):
+    return int(stat_line[stat_line.rindex(")") + 2:].split()[4 - 3])
+
+
+def parent_pid(pid):
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            return parse_parent_pid(f.read())
+    except (OSError, ValueError, IndexError):
+        return None
 
 
 def proc_start(pid):
@@ -142,6 +190,27 @@ def parse_session(text):
                 str(d["procStart"]))
     except (ValueError, KeyError, TypeError):
         return None
+
+
+def host_sessions(host_pid, live=None):
+    """Remote-control session ids a live `claude rc` host is serving.
+
+    The host runs one child per active session, and each child registers in
+    ~/.claude/sessions like any other Claude Code process. A session parked
+    idle may have no child at that moment, which is why the keeper only ever
+    adds to its list from here and prunes on the server's say-so instead.
+    """
+    if live is None:
+        live = live_sessions()
+    return sorted({canonical(s.bridge_session_id) for s in live
+                   if s.bridge_session_id and parent_pid(s.pid) == host_pid})
+
+
+def canonical(session_id):
+    """The session_ spelling. The API also uses a cse_ spelling of the same id."""
+    if session_id.startswith("cse_"):
+        return "session_" + session_id[len("cse_"):]
+    return session_id
 
 
 def live_sessions():
@@ -197,6 +266,51 @@ def claude_version():
         return "unknown"
 
 
+def _headers(token):
+    return {"Authorization": f"Bearer {token or access_token()}",
+            "anthropic-version": "2023-06-01",
+            "anthropic-beta": ENVIRONMENTS_BETA,
+            "x-environment-runner-version": claude_version(),
+            "Content-Type": "application/json"}
+
+
+class Refused(BridgeError):
+    """The server answered and said no: retrying will not help."""
+
+
+def reconnect(environment_id, session_id, token=None, base=API):
+    """Re-queue a session onto its environment for whatever host serves it.
+
+    Tries the cse_ spelling first (the one the server accepted in testing),
+    then the session_ one, as the client does. Raises Refused if every form
+    got a 4xx -- the session is archived, expired, or on another environment
+    -- and BridgeError for anything that might succeed later.
+    """
+    if not re.fullmatch(r"env_[A-Za-z0-9]+", environment_id):
+        raise BridgeError(f"refusing malformed environment id {environment_id!r}")
+    sid = canonical(session_id)
+    if not re.fullmatch(r"session_[A-Za-z0-9]+", sid):
+        raise BridgeError(f"refusing malformed session id {session_id!r}")
+    headers = _headers(token)
+    refusals = []
+    for form in ("cse_" + sid[len("session_"):], sid):
+        req = urllib.request.Request(
+            f"{base}/v1/environments/{environment_id}/bridge/reconnect",
+            method="POST", data=json.dumps({"session_id": form}).encode(),
+            headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=15):
+                return
+        except urllib.error.HTTPError as e:
+            body = e.read().decode(errors="replace")[:300]
+            if e.code >= 500:
+                raise BridgeError(f"reconnect {sid}: HTTP {e.code} {body}")
+            refusals.append(f"{form}: HTTP {e.code} {body}")
+        except urllib.error.URLError as e:
+            raise BridgeError(f"reconnect {sid}: {e.reason}")
+    raise Refused(f"reconnect {sid} refused: " + "; ".join(refusals))
+
+
 def deregister(environment_id, token=None, base=API):
     """Delete one environment registration on the server.
 
@@ -207,10 +321,7 @@ def deregister(environment_id, token=None, base=API):
         raise BridgeError(f"refusing malformed environment id {environment_id!r}")
     req = urllib.request.Request(
         f"{base}/v1/environments/bridge/{environment_id}", method="DELETE",
-        headers={"Authorization": f"Bearer {token or access_token()}",
-                 "anthropic-version": "2023-06-01",
-                 "anthropic-beta": ENVIRONMENTS_BETA,
-                 "x-environment-runner-version": claude_version()})
+        headers=_headers(token))
     try:
         with urllib.request.urlopen(req, timeout=15) as r:
             return 200 <= r.status < 300

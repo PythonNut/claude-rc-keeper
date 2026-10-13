@@ -6,7 +6,8 @@ Kept sessions run in windows of a private tmux server (`tmux -L crc`) owned by a
 systemd user unit. When the unit starts, it resumes each one. It handles two
 kinds:
 
-- **rc**: a `claude rc` host, resumed with `claude rc --session-id`.
+- **rc**: a `claude rc` host, resumed on its original environment with every
+  session it was serving (see below).
 - **interactive**: a terminal `claude` with remote control turned on (via
   `/remote-control` or `--remote-control`), resumed with
   `claude --resume <conversation> --remote-control`. That keeps the same
@@ -33,11 +34,43 @@ The client records the last host per folder in
 find the stale environment and makes the same `DELETE` call the client makes on
 a clean shutdown.
 
+## How a host comes back with all its sessions
+
+One `claude rc` host can serve many sessions, and each session is bound to the
+host's *environment*. The server won't hand a session to any other
+environment ("Session does not belong to this environment"). So the host has
+to come back on the same one. Here is what the client offers:
+
+- `claude rc --session-id X` and `claude rc -c` reuse the environment, but
+  always start in **single-session** mode ("Single session · exits when
+  complete"), so the host's other sessions can't come back through them.
+- A plain `claude rc` reads the folder's bridge pointer, asks to reuse that
+  environment, and stays **multi-session**. The server grants the reuse even
+  for an environment that was deregistered. The client adopts the session the
+  pointer names.
+
+So restore:
+
+1. writes a fresh pointer naming the environment and the first session (the
+   client ignores pointers older than a few hours, and a long outage would
+   otherwise lose the environment),
+2. starts a plain `claude rc`,
+3. once it has registered, re-queues every other remembered session onto the
+   same environment with `POST /v1/environments/<env>/bridge/reconnect`. That's
+   the call the client uses to adopt its own sessions.
+
+The pointer only ever names one session, so crc remembers the rest itself.
+`crc sync` records each live host's sessions from its child processes. A
+user timer runs it every 3 minutes, and `adopt` and `restore` run it too. It
+only adds to the list, because a session parked idle has no child process. A
+session leaves the list when the server refuses to re-queue it (archived or
+expired).
+
 ## Install
 
     make install                      # to ~/.local; no root
     systemctl --user daemon-reload
-    systemctl --user enable claude-rc-keeper.service
+    systemctl --user enable claude-rc-keeper.service claude-rc-keeper-sync.timer
     crc doctor
 
 To resume at boot before you log in, it also needs `loginctl enable-linger`.
@@ -49,6 +82,7 @@ Without it, restore runs when you log in.
     crc new -i [DIR] [--name N]          same, as a terminal `claude --remote-control`
     crc adopt [DIR] [--pid N]            keep a session already running there
     crc ls                               state of each kept folder
+    crc sync                             record sessions opened on kept hosts
     crc attach                           look at the sessions (tmux -L crc)
     crc rm DIR                           stop keeping DIR; stops it and releases it
     crc release [DIR]                    just the stale-registration fix
@@ -60,11 +94,11 @@ session with remote control on. An interactive session is never relaunched
 while its conversation is already open somewhere else.
 
 FLAGS after `--` are passed to `claude rc` (or `claude`, with `-i`) and reused
-on every resume. Spawn flags (`--spawn`, `--capacity`) cannot be combined with
-`--session-id`, so don't pass them here.
+on every resume. Don't pass `--spawn=session`: it makes the host
+single-session, so the other sessions can't be re-queued onto it.
 
-Sessions you start from claude.ai/code on a kept host are not tracked one by
-one. The host's own session is.
+Sessions you start from claude.ai/code on a kept host are picked up by the
+next sync. One opened less than a sync interval before a crash can be missed.
 
 ## Safety
 
@@ -84,9 +118,13 @@ kept session's own environment without `--force`.
 ## Fragility
 
 `lib/bridge.py` depends on undocumented Claude Code internals: the
-`~/.claude` layout, the bridge-pointer schema, the OAuth credentials file, and
-the environments API with its `anthropic-beta` header. They are all in that
-one file, so an update that changes them breaks releasing, not resuming. An
+`~/.claude` layout (including the per-process `sessions/` registry), the
+bridge-pointer schema and the client's choice to reuse its environment, the
+OAuth credentials file, and the environments API (deregister and
+`bridge/reconnect`) with its `anthropic-beta` header. They are all in that
+one file. If an update changes them, the likely failure is a host that comes
+back with only its first session, or on a new environment, which `crc
+restore` logs. An
 expired login token makes release fail until `claude` has been run once to
 refresh it. `crc` never refreshes the token itself, because doing so rotates
 the refresh token behind the client's back.

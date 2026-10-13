@@ -1,0 +1,8 @@
+# Records sessions opened on kept rc hosts since the last run, so a crash
+# loses at most one interval's worth. Local only: reads /proc and ~/.claude.
+[Unit]
+Description=Record sessions on kept Claude Code remote-control hosts
+
+[Service]
+Type=oneshot
+ExecStart=@BINDIR@/crc sync

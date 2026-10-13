@@ -2,13 +2,15 @@
 
 One entry per folder. Two kinds:
 
-  rc           a `claude rc` host. Resumed with `claude rc --session-id`. The
-               server lets one host serve a folder at a time, and a dead one
-               blocks the next until its registration is released. The entry
-               remembers the environment it was registered on: the client's
-               own bridge pointer only holds the latest host, so after an
-               accidental second `claude rc` in a folder it no longer knows
-               which session was the one that mattered.
+  rc           a `claude rc` host, which may serve several sessions. The entry
+               remembers its environment, its first session, and every other
+               session seen on it (sync). Restore points the folder's bridge
+               pointer at that environment, starts a plain multi-session
+               `claude rc` -- which reuses the environment and adopts the
+               first session -- then re-queues the others onto it. See
+               bridge.py for why `--session-id` cannot do this. The server
+               lets one host serve a folder at a time, and a dead one from
+               another environment blocks the next until it is released.
   interactive  a terminal `claude` with remote control turned on. It never
                registers an environment, so `claude rc` cannot reattach it and
                nothing can block it; it comes back with
@@ -91,7 +93,8 @@ def plan(entry, pointer, pointer_alive, window):
     if window is not None and not window.dead:
         return RUNNING, window.id
     if pointer is not None and pointer_alive:
-        if pointer.session_id == entry["session_id"]:
+        if (pointer.session_id == entry["session_id"]
+                or pointer.environment_id == entry.get("environment_id")):
             return ELSEWHERE, pointer.pid
         return OCCUPIED, pointer.pid
     if pointer is not None and pointer.environment_id != entry.get("environment_id"):
@@ -184,10 +187,50 @@ def start(directory, name, argv, confirm, timeout=60):
 
 
 def resume_argv(entry):
+    """Plain `claude rc` for a host: it reuses the environment named by the
+    pointer we write first, and stays multi-session, which --session-id would
+    not."""
     if kind(entry) == "interactive":
         return ["claude", "--resume", entry["transcript_id"], "--remote-control",
                 *entry.get("args", [])]
-    return ["claude", "rc", "--session-id", entry["session_id"], *entry.get("args", [])]
+    return ["claude", "rc", *entry.get("args", [])]
+
+
+def sync_one(directory, entry, live=None):
+    """Add any sessions the folder's live host is serving to the entry.
+
+    Only adds. A session parked idle has no child process at that moment, so
+    absence here proves nothing; sessions leave the list only when the server
+    refuses to re-queue them. Returns the newly seen ids.
+    """
+    if kind(entry) != "rc":
+        return []
+    p = bridge.read_pointer(directory)
+    if (p is None or not bridge.host_alive(p)
+            or p.environment_id != entry.get("environment_id")):
+        return []
+    known = {entry["session_id"], *entry.get("sessions", [])}
+    new = [s for s in bridge.host_sessions(p.pid, live) if s not in known]
+    if new:
+        entry["sessions"] = sorted(set(entry.get("sessions", [])) | set(new))
+    return new
+
+
+def requeue(directory, entry, log):
+    """Hand every remembered session but the first back to the restored host.
+    The first is adopted by the client itself, from the pointer."""
+    keep = []
+    for sid in entry.get("sessions", []):
+        try:
+            bridge.reconnect(entry["environment_id"], sid)
+            log(f"{directory}: re-queued {sid}")
+            keep.append(sid)
+        except bridge.Refused as e:
+            log(f"{directory}: dropped {sid}, the server will not resume it: {e}")
+        except bridge.BridgeError as e:
+            log(f"{directory}: could not re-queue {sid} yet: {e}")
+            keep.append(sid)
+    entry["sessions"] = keep
 
 
 def release(environment_id, pointer=None):
@@ -259,9 +302,20 @@ def restore_one(directory, entry, log=print):
         except bridge.BridgeError as e:
             log(f"{directory}: release failed: {e}; trying to resume anyway")
 
-    log(f"{directory}: resuming {entry['session_id']}")
+    log(f"{directory}: resuming {entry['environment_id']} with "
+        f"{1 + len(entry.get('sessions', []))} session(s)")
+    bridge.write_pointer(directory, entry["session_id"], entry["environment_id"])
     wid, p, err = start(directory, entry.get("name") or os.path.basename(directory),
                         resume_argv(entry), rc_started(directory))
     if err is None:
-        entry["environment_id"] = p.environment_id
+        if p.environment_id != entry["environment_id"]:
+            # The server would not give the environment back, so nothing on it
+            # can return. Keep what the new host has, so the next restore works.
+            log(f"{directory}: came back on a new environment {p.environment_id}; "
+                f"the {1 + len(entry.get('sessions', []))} session(s) on "
+                f"{entry['environment_id']} cannot follow it")
+            entry.update(environment_id=p.environment_id, session_id=p.session_id,
+                         sessions=[])
+        else:
+            requeue(directory, entry, log)
     return finish(directory, entry, wid, err, log)

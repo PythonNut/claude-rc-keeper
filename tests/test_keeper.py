@@ -43,6 +43,18 @@ class Plan(unittest.TestCase):
     def test_own_session_alive_elsewhere_is_left_alone(self):
         self.assertEqual(keeper.plan(ENTRY, ptr(), True, None), (keeper.ELSEWHERE, 1234))
 
+    def test_own_environment_alive_elsewhere_is_left_alone(self):
+        """Its pointer may name another of our sessions, e.g. after the first ended."""
+        self.assertEqual(keeper.plan(ENTRY, ptr("session_OTHER"), True, None)[0],
+                         keeper.ELSEWHERE)
+
+    def test_our_own_restore_pointer_launches(self):
+        """The pointer restore writes has no pid; it must not read as stale."""
+        p = bridge.parse_pointer('{"sessionId":"session_KEEP","environmentId":"env_KEEP",'
+                                 '"source":"standalone"}')
+        self.assertEqual(keeper.plan(ENTRY, p, bridge.host_alive(p), None),
+                         (keeper.LAUNCH, None))
+
     def test_live_foreign_host_is_never_released(self):
         """A different session that is actually running: refuse, never delete."""
         self.assertEqual(keeper.plan(ENTRY, ptr("other", "env_other"), True, None)[0],
@@ -111,6 +123,53 @@ class AdoptCandidates(unittest.TestCase):
         self.assertEqual([s.pid for s in keeper.interactive_in("/d", sessions)], [1])
 
 
+class Sync(unittest.TestCase):
+    """sync_one against a fake host: this process, with a real child."""
+
+    def setUp(self):
+        import subprocess
+        self.tmp = tempfile.TemporaryDirectory()
+        self.old = os.environ.get("CLAUDE_CONFIG_DIR")
+        os.environ["CLAUDE_CONFIG_DIR"] = self.tmp.name
+        self.child = subprocess.Popen(["sleep", "30"])
+        me = os.getpid()
+        d = os.path.join(self.tmp.name, "projects", "-d")
+        os.makedirs(d)
+        with open(os.path.join(d, bridge.POINTER), "w") as f:
+            json.dump({"sessionId": "session_KEEP", "environmentId": "env_KEEP",
+                       "source": "standalone", "pid": me,
+                       "procStart": bridge.proc_start(me)}, f)
+        self.live = [live(pid=self.child.pid, bridge_id="cse_EXTRA", entrypoint="sdk-cli"),
+                     live(pid=self.child.pid, bridge_id="session_KEEP", entrypoint="sdk-cli"),
+                     live(pid=1, bridge_id="session_NOTOURS", entrypoint="sdk-cli")]
+
+    def tearDown(self):
+        self.child.kill()
+        self.child.wait()
+        if self.old is None:
+            del os.environ["CLAUDE_CONFIG_DIR"]
+        else:
+            os.environ["CLAUDE_CONFIG_DIR"] = self.old
+        self.tmp.cleanup()
+
+    def test_adds_children_of_live_host_only(self):
+        e = dict(ENTRY, sessions=[])
+        self.assertEqual(keeper.sync_one("/d", e, self.live), ["session_EXTRA"])
+        self.assertEqual(e["sessions"], ["session_EXTRA"])
+
+    def test_never_removes(self):
+        e = dict(ENTRY, sessions=["session_IDLE"])
+        keeper.sync_one("/d", e, self.live)
+        self.assertEqual(e["sessions"], ["session_EXTRA", "session_IDLE"])
+
+    def test_host_on_another_environment_is_not_ours(self):
+        e = dict(ENTRY, environment_id="env_ELSE", sessions=[])
+        self.assertEqual(keeper.sync_one("/d", e, self.live), [])
+
+    def test_interactive_entries_are_skipped(self):
+        self.assertEqual(keeper.sync_one("/d", dict(IENTRY), self.live), [])
+
+
 class Registry(unittest.TestCase):
 
     def setUp(self):
@@ -139,11 +198,11 @@ class Registry(unittest.TestCase):
         keeper.save({})
         self.assertEqual(os.listdir(keeper.state_dir()), ["sessions.json"])
 
-    def test_resume_argv_carries_extra_flags(self):
+    def test_resume_argv_is_plain_rc(self):
+        """--session-id would force single-session mode and strand the rest."""
         e = dict(ENTRY, args=["--permission-mode", "auto"])
         self.assertEqual(keeper.resume_argv(e),
-                         ["claude", "rc", "--session-id", "session_KEEP",
-                          "--permission-mode", "auto"])
+                         ["claude", "rc", "--permission-mode", "auto"])
 
 
 if __name__ == "__main__":
