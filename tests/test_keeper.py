@@ -246,6 +246,36 @@ class DryRun(unittest.TestCase):
         self.assertIn("would run claude --resume", lines[0])
 
 
+class MoveCheck(unittest.TestCase):
+    """move_check decides whether crc move may stop and relaunch anything."""
+
+    def check(self, entry=ENTRY, old_alive=False, new_kept=False, new_ptr=None,
+              new_alive=False, old="/old", new="/new"):
+        return keeper.move_check(old, new, entry, old_alive, new_kept, new_ptr, new_alive)
+
+    def test_plain_move_is_allowed(self):
+        self.assertIsNone(self.check())
+
+    def test_same_folder_is_refused(self):
+        self.assertIsNotNone(self.check(new="/old"))
+
+    def test_nothing_to_move_is_refused(self):
+        self.assertIsNotNone(self.check(entry=None))
+
+    def test_host_running_outside_crc_is_never_stopped(self):
+        self.assertIn("outside crc", self.check(old_alive=True))
+
+    def test_kept_destination_is_refused(self):
+        self.assertIsNotNone(self.check(new_kept=True))
+
+    def test_live_host_in_destination_is_refused(self):
+        self.assertIsNotNone(self.check(new_ptr=ptr("other", "env_other"), new_alive=True))
+
+    def test_dead_host_in_destination_is_left_to_restore(self):
+        """restore releases it, under the same rules as any kept folder."""
+        self.assertIsNone(self.check(new_ptr=ptr("other", "env_other")))
+
+
 class Registry(unittest.TestCase):
 
     def setUp(self):

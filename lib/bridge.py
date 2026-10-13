@@ -34,6 +34,7 @@ says which environment each session is bound to.
 import json
 import os
 import re
+import shutil
 import subprocess
 import time
 import urllib.error
@@ -130,6 +131,35 @@ def remove_pointer(pointer):
         os.unlink(pointer.path)
     except FileNotFoundError:
         pass
+
+
+def copy_project(old_dir, new_dir):
+    """Copy a folder's conversations to the project key of another folder.
+
+    `claude --resume` looks a conversation up under the current folder's key,
+    so a session moved to new_dir needs its transcript there. Copies, never
+    moves or overwrites: the old copies stay as a backup, and anything already
+    under the new key wins. The bridge pointer is not copied; it describes a
+    host, not a conversation. Returns the names copied.
+    """
+    src = os.path.join(claude_dir(), "projects", project_key(old_dir))
+    dst = os.path.join(claude_dir(), "projects", project_key(new_dir))
+    try:
+        names = sorted(os.listdir(src))
+    except FileNotFoundError:
+        return []
+    os.makedirs(dst, exist_ok=True)
+    copied = []
+    for n in names:
+        s, t = os.path.join(src, n), os.path.join(dst, n)
+        if n == POINTER or os.path.lexists(t):
+            continue
+        if os.path.isdir(s) and not os.path.islink(s):
+            shutil.copytree(s, t, symlinks=True)
+        else:
+            shutil.copy2(s, t, follow_symlinks=False)
+        copied.append(n)
+    return copied
 
 
 def parse_proc_start(stat_line):

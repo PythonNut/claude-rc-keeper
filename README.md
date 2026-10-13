@@ -73,6 +73,17 @@ removes nothing, since an idle session has no process. `crc ls` then flags the
 host as possibly missing sessions. A session also leaves the list when the
 server refuses to re-queue it.
 
+## Moving a folder
+
+`crc move OLD NEW` carries a kept session to a folder its files were moved
+to. It copies the conversations to NEW's project key, stops a crc-run host in
+OLD, and restores in NEW. The server lets an environment be reused from a
+different folder (tested on 2.1.283), so an rc host keeps its environment and
+every claude.ai link; the old folder's pointer is removed so it can't claim
+the environment back. A folder that isn't kept but has a pointer is moved too,
+with only the session the pointer names. A host still running outside crc is
+refused: exit it first.
+
 ## Install
 
     make install                      # to ~/.local; no root
@@ -94,6 +105,7 @@ Without it, restore runs when you log in.
     crc attach                           look at the sessions (tmux -L crc)
     crc rm DIR                           stop keeping DIR; stops it and releases it
     crc release [DIR]                    just the stale-registration fix
+    crc move OLD NEW                     carry a kept session to a moved folder
     crc stale                            list stale registrations in every folder
     crc restore [--dry-run]              what the unit runs at start; --dry-run
                                          shows what it would start, re-queue and

@@ -112,6 +112,29 @@ def plan_interactive(entry, live, window):
     return LAUNCH, None
 
 
+def move_check(old, new, entry, old_alive, new_kept, new_pointer, new_alive):
+    """Why a kept session cannot move from old to new, or None if it can.
+
+    A host running under crc is stopped by the move itself; one running
+    outside crc is not ours to stop. A live host in new would make the server
+    refuse the one we start there; a dead one is released by the restore that
+    finishes the move, as for any kept folder.
+    """
+    if old == new:
+        return "old and new are the same folder"
+    if entry is None:
+        return f"{old} is not kept and has no bridge pointer; nothing to move"
+    if old_alive:
+        return (f"a claude in {old} is still running outside crc; exit it first "
+                f"(Ctrl-C an rc host, /exit a terminal session)")
+    if new_kept:
+        return f"{new} is already kept; `crc rm` it first"
+    if new_pointer is not None and new_alive:
+        return (f"a claude rc (pid {new_pointer.pid}) is serving {new}; "
+                f"stop it first")
+    return None
+
+
 def state_of(directory, entry):
     """(action, detail) for one kept folder, as things stand right now."""
     window = tmuxctl.window_for(directory)

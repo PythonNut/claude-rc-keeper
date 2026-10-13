@@ -10,6 +10,7 @@
     crc restore [--dry-run]             bring back every kept session (boot)
     crc attach                          attach to the tmux session hosting them
     crc rm DIR [--keep-registration]    stop keeping DIR, stop it, release it
+    crc move OLD NEW                    carry a kept session to a moved folder
     crc release [DIR] [--force]         release a dead host's stale registration
     crc stale                           list stale registrations in every folder
     crc doctor                          check what restore depends on
@@ -277,6 +278,71 @@ def cmd_rm(a):
             print(f"could not release {env}: {err}", file=sys.stderr)
 
 
+def cmd_move(a):
+    """Carry a kept session to a folder the files were moved to.
+
+    The new folder must already exist; crc moves sessions, not files. Copies
+    the conversations to the new folder's project key, stops a crc-run host in
+    the old folder, then restores in the new one: an rc host asks to reuse its
+    old environment there, and a terminal session resumes its conversation.
+    """
+    old, new = folder(a.old), folder(a.new)
+    if not os.path.isdir(new):
+        die(f"{new} is not a directory; move the files there first")
+    entries = keeper.load()
+    e = entries.get(old)
+    p = bridge.read_pointer(old)
+    if e is None and p is not None:
+        # Not kept, but a host ran there: move that, knowing only its first session.
+        e = {"kind": "rc", "session_id": p.session_id, "environment_id": p.environment_id,
+             "sessions": [], "name": os.path.basename(old) or old, "args": [],
+             "added": keeper.now(), "last_status": "stopped", "last_error": None}
+    w = tmuxctl.window_for(old)
+    if e is None:
+        old_alive = False
+    elif keeper.kind(e) == "interactive":
+        old_alive = any(s.transcript_id == e["transcript_id"] and (w is None or s.pid != w.pid)
+                        for s in bridge.live_sessions())
+    else:
+        old_alive = p is not None and bridge.host_alive(p) and (w is None or p.pid != w.pid)
+    np = bridge.read_pointer(new)
+    err = keeper.move_check(old, new, e, old_alive, new in entries, np,
+                            np is not None and bridge.host_alive(np))
+    if err:
+        die(err)
+    if w is not None and not w.dead:
+        print(f"stopping {old} (window {w.id})")
+    if w is not None:
+        stop_window(w, keeper.kind(e) == "interactive")
+    copied = bridge.copy_project(old, new)
+    print(f"copied {len(copied)} conversation file(s) to {new}'s project")
+    if e.get("name") == (os.path.basename(old) or old):
+        e["name"] = os.path.basename(new) or new
+    entries.pop(old, None)
+    entries[new] = e
+    keeper.save(entries)
+    env_before = e.get("environment_id")
+    ok = keeper.restore_one(new, e)
+    keeper.save(entries)
+    if not ok:
+        die(f"{new} did not come up; `crc ls` shows why and `crc restore` retries. "
+            f"{old} is no longer kept; its conversations are still there.")
+    if keeper.kind(e) == "rc" and e["environment_id"] == env_before:
+        # The environment now lives in new. Left in place, the old pointer would
+        # send the next `claude rc` in old after it too.
+        if p is not None and p.environment_id == env_before:
+            bridge.remove_pointer(p)
+        print(f"moved {old} -> {new}; same environment, so claude.ai links are unchanged")
+    elif keeper.kind(e) == "rc":
+        print(f"moved {old} -> {new}, but on a new environment {e['environment_id']}: "
+              f"the claude.ai links changed and the old sessions stayed behind on "
+              f"{env_before}. Their conversations were copied, so "
+              f"`claude --resume <id>` in {new} can continue one; "
+              f"`crc release {old}` drops the old registration.")
+    else:
+        print(f"moved {old} -> {new}")
+
+
 def cmd_release(a):
     d = folder(a.dir)
     p = bridge.read_pointer(d)
@@ -419,6 +485,11 @@ def main():
     s.add_argument("--keep-registration", action="store_true",
                    help="leave the server registration in place")
     s.set_defaults(fn=cmd_rm)
+
+    s = sub.add_parser("move", help="carry a kept session to a moved folder")
+    s.add_argument("old")
+    s.add_argument("new")
+    s.set_defaults(fn=cmd_move)
 
     s = sub.add_parser("release", help="release a dead host's stale registration")
     s.add_argument("dir", nargs="?")

@@ -28,6 +28,45 @@ class ProjectKey(unittest.TestCase):
         self.assertEqual(bridge.project_key("/a b/c.d_e"), "-a-b-c-d-e")
 
 
+class CopyProject(unittest.TestCase):
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.old = os.environ.get("CLAUDE_CONFIG_DIR")
+        os.environ["CLAUDE_CONFIG_DIR"] = self.tmp.name
+        self.src = os.path.join(self.tmp.name, "projects", "-a")
+        self.dst = os.path.join(self.tmp.name, "projects", "-b")
+        os.makedirs(os.path.join(self.src, "t1"))
+        for n, body in (("t1.jsonl", "old"), ("t2.jsonl", "old"),
+                        (bridge.POINTER, "{}"), ("t1/x", "side")):
+            with open(os.path.join(self.src, n), "w") as f:
+                f.write(body)
+
+    def tearDown(self):
+        if self.old is None:
+            del os.environ["CLAUDE_CONFIG_DIR"]
+        else:
+            os.environ["CLAUDE_CONFIG_DIR"] = self.old
+        self.tmp.cleanup()
+
+    def test_copies_conversations_but_not_the_pointer(self):
+        self.assertEqual(bridge.copy_project("/a", "/b"), ["t1", "t1.jsonl", "t2.jsonl"])
+        self.assertTrue(os.path.exists(os.path.join(self.dst, "t1", "x")))
+        self.assertFalse(os.path.exists(os.path.join(self.dst, bridge.POINTER)))
+        self.assertTrue(os.path.exists(os.path.join(self.src, "t1.jsonl")))
+
+    def test_never_overwrites(self):
+        os.makedirs(self.dst)
+        with open(os.path.join(self.dst, "t2.jsonl"), "w") as f:
+            f.write("new")
+        self.assertNotIn("t2.jsonl", bridge.copy_project("/a", "/b"))
+        with open(os.path.join(self.dst, "t2.jsonl")) as f:
+            self.assertEqual(f.read(), "new")
+
+    def test_missing_source_copies_nothing(self):
+        self.assertEqual(bridge.copy_project("/nowhere", "/b"), [])
+
+
 class Pointer(unittest.TestCase):
 
     def test_parses_real_pointer(self):
