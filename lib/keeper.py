@@ -32,6 +32,9 @@ import tmuxctl
 # Output from the client when the server still has another host registered
 # for the folder.
 ALREADY_SERVED = "already served"
+# The client's prompt in a folder it has not been told to trust; it waits for
+# a keypress, so a launch there never registers.
+TRUST_PROMPT = "Quick safety check"
 
 
 def state_dir():
@@ -130,8 +133,16 @@ def move_check(old, new, entry, old_alive, new_kept, new_pointer, new_alive):
     if new_kept:
         return f"{new} is already kept; `crc rm` it first"
     if new_pointer is not None and new_alive:
-        return (f"a claude rc (pid {new_pointer.pid}) is serving {new}; "
-                f"stop it first")
+        # One folder, one host: the client refuses a second `claude rc` there
+        # even for another environment (and through a symlink), and the server
+        # will not re-queue a session onto an environment it was not born on.
+        return (f"a claude rc (pid {new_pointer.pid}, session {new_pointer.session_id}) "
+                f"is serving {new}, and a folder can have only one host, so "
+                f"{old}'s sessions cannot join it. Either stop that host first "
+                f"(its own sessions then stay behind on {new_pointer.environment_id}), "
+                f"or move {old} somewhere else; or continue one of its "
+                f"conversations in {new} with `claude --resume <id> "
+                f"--remote-control`, which gets a new claude.ai link")
     return None
 
 
@@ -206,6 +217,11 @@ def start(directory, name, argv, confirm, timeout=60):
         r = confirm(w)
         if r is not None:
             return wid, r, None
+        if TRUST_PROMPT in tmuxctl.capture(wid, lines=15):
+            # Whether to trust a folder is the user's call, not ours.
+            tmuxctl.kill(wid)
+            return wid, None, (f"Claude Code asks whether to trust {directory}; "
+                               f"run `claude` there once and accept, then retry")
     return wid, None, f"no registration after {timeout}s:\n{tmuxctl.capture(wid)}"
 
 

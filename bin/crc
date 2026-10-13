@@ -68,8 +68,9 @@ def cmd_new(a):
         confirm = keeper.rc_started(d)
     wid, r, err = keeper.start(d, name, argv, confirm)
     if err is not None:
-        die(f"{argv[0]} {argv[1]} did not start in {d}:\n{err}\n(window {wid} "
-            f"left open in `crc attach` for a closer look)")
+        left = (f"\n(window {wid} left open in `crc attach` for a closer look)"
+                if tmuxctl.get(wid) is not None else "")
+        die(f"{argv[0]} {argv[1]} did not start in {d}:\n{err}{left}")
     e = {"name": name, "args": a.args, "added": keeper.now(),
          "updated": keeper.now(), "last_status": "running", "last_error": None}
     if a.interactive:
@@ -297,6 +298,14 @@ def cmd_move(a):
         e = {"kind": "rc", "session_id": p.session_id, "environment_id": p.environment_id,
              "sessions": [], "name": os.path.basename(old) or old, "args": [],
              "added": keeper.now(), "last_status": "stopped", "last_error": None}
+    if e is not None:
+        # Re-queue every session the server has on the environment, including
+        # idle ones the timer may not have recorded yet.
+        added, _ = keeper.sync_one(old, e, bridge.live_sessions(),
+                                   keeper.fetch_server_sessions(
+                                       lambda m: print(f"crc: {m}", file=sys.stderr)))
+        for sid in added:
+            print(f"{old}: also moving {sid}")
     w = tmuxctl.window_for(old)
     if e is None:
         old_alive = False
