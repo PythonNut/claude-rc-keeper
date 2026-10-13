@@ -196,24 +196,66 @@ def resume_argv(entry):
     return ["claude", "rc", *entry.get("args", [])]
 
 
-def sync_one(directory, entry, live=None):
-    """Add any sessions the folder's live host is serving to the entry.
+def sync_one(directory, entry, live=None, server=None):
+    """Bring the entry's list of sessions up to date. Returns (added, dropped).
 
-    Only adds. A session parked idle has no child process at that moment, so
-    absence here proves nothing; sessions leave the list only when the server
-    refuses to re-queue them. Returns the newly seen ids.
+    server is the account's session list (bridge.server_sessions), or None if
+    it could not be fetched. With it, every session the server has on our
+    environment is kept and every one it reports archived is dropped; that
+    covers sessions parked idle, which have no process. Without it, only the
+    children of a live host are added, and nothing is dropped, since absence
+    there proves nothing -- the entry is marked so `crc ls` can say its list
+    may be short.
     """
     if kind(entry) != "rc":
-        return []
+        return [], []
+    env = entry.get("environment_id")
+    first = entry["session_id"]
+    have = set(entry.get("sessions", []))
+    seen = set()
     p = bridge.read_pointer(directory)
-    if (p is None or not bridge.host_alive(p)
-            or p.environment_id != entry.get("environment_id")):
-        return []
-    known = {entry["session_id"], *entry.get("sessions", [])}
-    new = [s for s in bridge.host_sessions(p.pid, live) if s not in known]
-    if new:
-        entry["sessions"] = sorted(set(entry.get("sessions", [])) | set(new))
-    return new
+    if p is not None and bridge.host_alive(p) and p.environment_id == env:
+        seen |= set(bridge.host_sessions(p.pid, live))
+    archived = set()
+    if server is not None:
+        for s in server:
+            if env and s.environment_id == env:
+                (archived if s.status == "archived" else seen).add(s.id)
+        entry["synced_from"] = "server"
+    else:
+        entry["synced_from"] = "processes"
+    added = sorted(seen - archived - have - {first})
+    dropped = sorted(have & archived)
+    if added or dropped:
+        entry["sessions"] = sorted((have | set(added)) - archived)
+    return added, dropped
+
+
+def fetch_server_sessions(log=None):
+    """The server's session list, or None (logged) if it cannot be had."""
+    try:
+        return bridge.server_sessions()
+    except bridge.BridgeError as e:
+        if log:
+            log(f"could not list sessions from the server ({e}); "
+                f"using local processes only")
+        return None
+
+
+def sync_all(entries, log=print):
+    """sync_one over every entry. Returns True if anything changed."""
+    live = bridge.live_sessions()
+    server = fetch_server_sessions(log)
+    changed = False
+    for d, e in sorted(entries.items()):
+        before = e.get("synced_from")
+        added, dropped = sync_one(d, e, live, server)
+        for sid in added:
+            log(f"{d}: now also keeping {sid}")
+        for sid in dropped:
+            log(f"{d}: dropped {sid}, archived")
+        changed |= bool(added or dropped) or before != e.get("synced_from")
+    return changed
 
 
 def requeue(directory, entry, log):
@@ -251,9 +293,18 @@ def finish(directory, entry, wid, err, log):
     return False
 
 
-def restore_interactive(directory, entry, log):
+def restore_interactive(directory, entry, log, dry_run=False):
     action, detail = plan_interactive(entry, bridge.live_sessions(),
                                       tmuxctl.window_for(directory))
+    if dry_run:
+        if action == RUNNING:
+            log(f"{directory}: running in {detail}; nothing to do")
+        elif action == ELSEWHERE:
+            log(f"{directory}: running outside crc (pid {detail}); would leave it alone")
+        else:
+            log(f"{directory}: would run {' '.join(resume_argv(entry))}")
+        return True
+    entry["updated"] = now()
     if action == RUNNING:
         entry["last_status"], entry["last_error"] = "running", None
         return True
@@ -271,15 +322,40 @@ def restore_interactive(directory, entry, log):
     return finish(directory, entry, wid, err, log)
 
 
-def restore_one(directory, entry, log=print):
+def describe(directory, entry, action, detail, pointer, log):
+    """What restore_one would do, for --dry-run. Changes nothing."""
+    if action == RUNNING:
+        log(f"{directory}: running in {detail}; nothing to do")
+        return
+    if action == ELSEWHERE:
+        log(f"{directory}: running outside crc (pid {detail}); would leave it alone")
+        return
+    if action == OCCUPIED:
+        log(f"{directory}: blocked by another live claude rc (pid {detail}, "
+            f"session {pointer.session_id}); would do nothing")
+        return
+    if action == RELEASE:
+        log(f"{directory}: would release stale registration {detail} "
+            f"(session {pointer.session_id}, host pid {pointer.pid} is gone)")
+    log(f"{directory}: would point the folder at {entry['environment_id']}, "
+        f"run {' '.join(resume_argv(entry))} adopting {entry['session_id']}")
+    for sid in entry.get("sessions", []):
+        log(f"{directory}: would re-queue {sid}")
+
+
+def restore_one(directory, entry, log=print, dry_run=False):
     """Bring one kept folder back. Updates entry in place; returns True if it
-    is running (here or elsewhere) afterwards."""
-    entry["updated"] = now()
+    is running (here or elsewhere) afterwards. With dry_run, only logs what it
+    would do."""
     if kind(entry) == "interactive":
-        return restore_interactive(directory, entry, log)
+        return restore_interactive(directory, entry, log, dry_run)
     pointer = bridge.read_pointer(directory)
     alive = pointer is not None and bridge.host_alive(pointer)
     action, detail = plan(entry, pointer, alive, tmuxctl.window_for(directory))
+    if dry_run:
+        describe(directory, entry, action, detail, pointer, log)
+        return action != OCCUPIED
+    entry["updated"] = now()
 
     if action == RUNNING:
         entry["last_status"], entry["last_error"] = "running", None

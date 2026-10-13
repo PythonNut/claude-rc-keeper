@@ -28,7 +28,8 @@ server grants the reuse even for an environment that was deregistered. Once
 that host is up, POST .../bridge/reconnect on the same environment hands it
 each remaining session, the same call the client uses to adopt its own. The
 pointer only ever names one session, so the others have to be remembered by
-us (keeper.sync).
+us: keeper.sync_one, from the server's session list (server_sessions), which
+says which environment each session is bound to.
 """
 import json
 import os
@@ -179,6 +180,7 @@ class LiveSession(NamedTuple):
     cwd: str
     bridge_session_id: str      # its remote-control session, or "" if none
     entrypoint: str             # "cli" for a terminal session; rc children are "sdk-cli"
+    name: str = ""              # the client's local name for it
 
 
 def parse_session(text):
@@ -186,7 +188,8 @@ def parse_session(text):
         d = json.loads(text)
         return (LiveSession(int(d["pid"]), str(d["sessionId"]), str(d["cwd"]),
                             str(d.get("bridgeSessionId") or ""),
-                            str(d.get("entrypoint") or "")),
+                            str(d.get("entrypoint") or ""),
+                            str(d.get("name") or "")),
                 str(d["procStart"]))
     except (ValueError, KeyError, TypeError):
         return None
@@ -211,6 +214,51 @@ def canonical(session_id):
     if session_id.startswith("cse_"):
         return "session_" + session_id[len("cse_"):]
     return session_id
+
+
+def all_pointers():
+    """(project dir, pointer) for every folder the client has a pointer for."""
+    base = os.path.join(claude_dir(), "projects")
+    out = []
+    try:
+        names = sorted(os.listdir(base))
+    except OSError:
+        return out
+    for n in names:
+        path = os.path.join(base, n, POINTER)
+        try:
+            with open(path) as f:
+                p = parse_pointer(f.read(), path)
+        except OSError:
+            continue
+        if p is not None:
+            out.append((os.path.join(base, n), p))
+    return out
+
+
+def project_cwd(project_dir):
+    """The folder a project directory belongs to, from its transcripts.
+
+    project_key is not reversible ('-' stands for any non-alphanumeric), but
+    every transcript record carries the cwd it was written in.
+    """
+    try:
+        names = sorted(n for n in os.listdir(project_dir) if n.endswith(".jsonl"))
+    except OSError:
+        return None
+    for n in names:
+        try:
+            with open(os.path.join(project_dir, n)) as f:
+                for _, line in zip(range(50), f):
+                    try:
+                        cwd = json.loads(line).get("cwd")
+                    except (ValueError, AttributeError):
+                        continue
+                    if cwd:
+                        return cwd
+        except OSError:
+            continue
+    return None
 
 
 def live_sessions():
@@ -272,6 +320,59 @@ def _headers(token):
             "anthropic-beta": ENVIRONMENTS_BETA,
             "x-environment-runner-version": claude_version(),
             "Content-Type": "application/json"}
+
+
+class ServerSession(NamedTuple):
+    id: str                 # session_ spelling
+    environment_id: str
+    status: str             # idle, running, archived, ...
+    title: str
+
+
+# The beta the client sends when it lists sessions (for --teleport).
+SESSIONS_BETA = "ccr-byoc-2025-07-29"
+
+
+def parse_server_sessions(body):
+    out = []
+    for d in body.get("data", []):
+        try:
+            out.append(ServerSession(canonical(str(d["id"])),
+                                     str(d.get("environment_id") or ""),
+                                     str(d.get("session_status") or ""),
+                                     str(d.get("title") or "")))
+        except (KeyError, TypeError):
+            continue
+    return out
+
+
+def server_sessions(token=None, base=API, page_size=100, max_pages=50):
+    """Every session the account has, with the environment each is bound to.
+
+    This is how sync learns of sessions parked idle on a host, which have no
+    child process to find them by. Archived ones are included, so the caller
+    can tell "archived" from "not seen".
+    """
+    headers = {"Authorization": f"Bearer {token or access_token()}",
+               "anthropic-version": "2023-06-01",
+               "anthropic-beta": SESSIONS_BETA}
+    out, after = [], None
+    for _ in range(max_pages):
+        q = f"?limit={page_size}" + (f"&after_id={after}" if after else "")
+        req = urllib.request.Request(f"{base}/v1/sessions{q}", headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=20) as r:
+                body = json.load(r)
+        except urllib.error.HTTPError as e:
+            raise BridgeError(f"list sessions: HTTP {e.code} "
+                              f"{e.read().decode(errors='replace')[:300]}")
+        except (urllib.error.URLError, OSError, ValueError) as e:
+            raise BridgeError(f"list sessions: {e}")
+        out.extend(parse_server_sessions(body))
+        after = body.get("last_id")
+        if not body.get("has_more") or not after:
+            return out
+    raise BridgeError(f"list sessions: more than {max_pages} pages")
 
 
 class Refused(BridgeError):

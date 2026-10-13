@@ -5,12 +5,13 @@
                                         start `claude rc` in DIR and keep it;
                                         -i: a terminal `claude --remote-control`
     crc adopt [DIR] [--pid N]           keep a session already running in DIR
-    crc ls                              show kept sessions and their state
+    crc ls [--json]                     show kept sessions and their state
     crc sync                            record sessions opened on kept hosts (timer)
-    crc restore                         bring back every kept session (boot)
+    crc restore [--dry-run]             bring back every kept session (boot)
     crc attach                          attach to the tmux session hosting them
     crc rm DIR [--keep-registration]    stop keeping DIR, stop it, release it
     crc release [DIR] [--force]         release a dead host's stale registration
+    crc stale                           list stale registrations in every folder
     crc doctor                          check what restore depends on
 
 Kept sessions run in windows of a private tmux server (`tmux -L crc`), which
@@ -22,6 +23,7 @@ folder is already served" error); a terminal session with
 link.
 """
 import argparse
+import json
 import os
 import shutil
 import subprocess
@@ -91,7 +93,8 @@ def cmd_adopt(a):
     if a.pid is None and p is not None and bridge.host_alive(p):
         e.update(kind="rc", session_id=p.session_id, environment_id=p.environment_id,
                  sessions=[])
-        keeper.sync_one(d, e)
+        keeper.sync_one(d, e, server=keeper.fetch_server_sessions(
+            lambda m: print(f"crc: {m}", file=sys.stderr)))
         pid = p.pid
     else:
         found = keeper.interactive_in(d, bridge.live_sessions())
@@ -116,36 +119,70 @@ def cmd_adopt(a):
           f"restore on it runs under crc.")
 
 
+STATE_TEXT = {keeper.RUNNING: "running ({})",
+              keeper.ELSEWHERE: "running outside crc (pid {})",
+              keeper.OCCUPIED: "blocked: another live host (pid {})",
+              keeper.RELEASE: "stopped; stale registration {} to release",
+              keeper.LAUNCH: "stopped"}
+
+
 def cmd_ls(a):
     entries = keeper.load()
+    if a.json:
+        return ls_json(entries)
     if not entries:
         print("nothing kept; add a folder with `crc new` or `crc adopt`")
         return
     for d, e in sorted(entries.items()):
         action, detail = keeper.state_of(d, e)
-        state = {keeper.RUNNING: f"running ({detail})",
-                 keeper.ELSEWHERE: f"running outside crc (pid {detail})",
-                 keeper.OCCUPIED: f"blocked: another live host (pid {detail})",
-                 keeper.RELEASE: f"stopped; stale registration {detail} to release",
-                 keeper.LAUNCH: "stopped"}[action]
+        state = STATE_TEXT[action].format(detail)
         more = f" + {len(e['sessions'])} more" if e.get("sessions") else ""
         print(f"{e.get('name', '?'):20} {state}\n{'':20} {d}\n"
               f"{'':20} {keeper.kind(e)} {e['session_id']}{more}")
+        if keeper.kind(e) == "rc" and e.get("synced_from") != "server":
+            print(f"{'':20} sessions so far seen only from local processes; "
+                  f"idle ones may be missing until `crc sync` reaches the server")
         if action not in (keeper.RUNNING, keeper.ELSEWHERE) and e.get("last_error"):
             last = e["last_error"].splitlines()[-1]
             print(f"{'':20} last attempt: {e.get('last_status')}: {last}")
 
 
-def cmd_sync(a):
-    """Cheap and local: reads /proc and ~/.claude only, no network."""
-    entries = keeper.load()
+def ls_json(entries):
+    """Like ls, with each session's title (from the server, if reachable) and
+    the pid and local name of the process serving it, if one is running."""
     live = bridge.live_sessions()
-    changed = False
+    by_bridge = {bridge.canonical(s.bridge_session_id): s
+                 for s in live if s.bridge_session_id}
+    server = keeper.fetch_server_sessions(
+        lambda m: print(f"crc: {m}", file=sys.stderr))
+    titles = {s.id: s for s in server or []}
+    out = []
     for d, e in sorted(entries.items()):
-        for sid in keeper.sync_one(d, e, live):
-            print(f"{d}: now also keeping {sid}")
-            changed = True
-    if changed:
+        action, detail = keeper.state_of(d, e)
+        sessions = []
+        for sid in [e["session_id"], *e.get("sessions", [])]:
+            proc, srv = by_bridge.get(bridge.canonical(sid)), titles.get(bridge.canonical(sid))
+            sessions.append({"id": sid,
+                             "title": srv.title if srv else None,
+                             "status": srv.status if srv else None,
+                             "pid": proc.pid if proc else None,
+                             "local_name": proc.name or None if proc else None})
+        out.append({"dir": d, "name": e.get("name"), "kind": keeper.kind(e),
+                    "state": action, "detail": detail,
+                    "environment_id": e.get("environment_id"),
+                    "transcript_id": e.get("transcript_id"),
+                    "sessions": sessions,
+                    "synced_from": e.get("synced_from"),
+                    "last_status": e.get("last_status"),
+                    "last_error": e.get("last_error")})
+    json.dump(out, sys.stdout, indent=2)
+    print()
+
+
+def cmd_sync(a):
+    """One call to the server's session list, plus /proc and ~/.claude."""
+    entries = keeper.load()
+    if keeper.sync_all(entries):
         keeper.save(entries)
 
 
@@ -153,8 +190,22 @@ def cmd_restore(a):
     entries = keeper.load()
     if not entries:
         return 0
+    if a.dry_run:
+        # Work on a copy that is never saved: sync may add sessions to it,
+        # which shows what a real restore would re-queue.
+        keeper.sync_all(entries, log=lambda m: print(f"(sync) {m}"))
+        for d, e in sorted(entries.items()):
+            if not os.path.isdir(d):
+                print(f"{d}: folder missing (unmounted?); would skip")
+                continue
+            keeper.restore_one(d, e, dry_run=True)
+        return 0
     if not a.no_wait and not keeper.wait_network():
         print("network still unreachable; trying anyway", file=sys.stderr)
+    # The server knows every session on each environment, including any the
+    # timer had not yet recorded; ask before restoring rather than after.
+    if keeper.sync_all(entries):
+        keeper.save(entries)
     ok = True
     for d, e in sorted(entries.items()):
         if not os.path.isdir(d):
@@ -164,10 +215,9 @@ def cmd_restore(a):
             continue
         ok &= keeper.restore_one(d, e)
         keeper.save(entries)
-    # Hosts that were already running may have gained sessions since the last
-    # sync; record them now rather than waiting for the timer.
-    live = bridge.live_sessions()
-    if any([keeper.sync_one(d, e, live) for d, e in entries.items()]):
+    # Hosts that were already running may have gained sessions since; record
+    # them now rather than waiting for the timer.
+    if keeper.sync_all(entries):
         keeper.save(entries)
     return 0 if ok else 1
 
@@ -245,6 +295,49 @@ def cmd_release(a):
     print(f"released {p.environment_id} (session {p.session_id})")
 
 
+def cmd_stale(a):
+    """Every bridge pointer whose host is gone. Read-only."""
+    kept = {e.get("environment_id"): d for d, e in keeper.load().items()}
+    found = False
+    for pdir, p in bridge.all_pointers():
+        if bridge.host_alive(p):
+            continue
+        found = True
+        d = bridge.project_cwd(pdir)
+        print(f"{d or '(folder unknown: ' + os.path.basename(pdir) + ')'}\n"
+              f"    {p.environment_id}  session {p.session_id}  "
+              f"host pid {p.pid or '-'} gone")
+        if p.environment_id in kept:
+            print(f"    kept by crc for {kept[p.environment_id]}; restore reuses it, "
+                  f"do not release")
+        elif d:
+            print(f"    release with: crc release {d}")
+    if not found:
+        print("no stale registrations recorded")
+
+
+def login_shell_finds(names):
+    """Which of names a login shell finds, started the way the unit starts
+    one: the systemd user manager's environment, then $SHELL -lc."""
+    env = {"HOME": os.path.expanduser("~"), "USER": os.environ.get("USER", ""),
+           "LOGNAME": os.environ.get("LOGNAME", os.environ.get("USER", "")),
+           "SHELL": tmuxctl.login_shell()}
+    r = subprocess.run(["systemctl", "--user", "show-environment"],
+                       capture_output=True, text=True)
+    for line in r.stdout.splitlines():
+        k, _, v = line.partition("=")
+        if k in ("PATH", "HOME", "USER", "LOGNAME", "LANG") and v:
+            env[k] = v
+    env.setdefault("PATH", "/usr/local/bin:/usr/bin:/bin")
+    script = "; ".join(f'command -v {n} >/dev/null && echo {n}' for n in names)
+    try:
+        r = subprocess.run([env["SHELL"], "-lc", script], env=env, text=True,
+                           capture_output=True, stdin=subprocess.DEVNULL, timeout=20)
+    except (OSError, subprocess.TimeoutExpired):
+        return set()
+    return set(r.stdout.split())
+
+
 def cmd_doctor(a):
     ok = True
 
@@ -255,6 +348,16 @@ def cmd_doctor(a):
 
     check("claude on PATH", shutil.which("claude"), "install Claude Code")
     check("tmux on PATH", shutil.which("tmux"), "pacman -S tmux")
+    # What restore actually depends on: kept sessions start through a login
+    # shell in the unit's environment, not this terminal's.
+    found = login_shell_finds(["claude", "crc"])
+    shell = os.path.basename(tmuxctl.login_shell())
+    profile = {"zsh": "~/.zprofile", "bash": "~/.bash_profile"}.get(shell, "~/.profile")
+    check(f"claude on PATH in a clean {shell} login shell (how restore starts it)",
+          "claude" in found, f"add claude's directory to PATH in {profile}")
+    check(f"crc on PATH in a clean {shell} login shell (for use inside kept sessions)",
+          "crc" in found, f"add {os.path.dirname(os.path.realpath(sys.argv[0]))} "
+          f"to PATH in {profile}")
     try:
         bridge.access_token()
         check("Claude Code login token readable and current", True)
@@ -297,11 +400,16 @@ def main():
     s.add_argument("--pid", type=int, help="which terminal session, if several")
     s.set_defaults(fn=cmd_adopt)
 
-    sub.add_parser("ls", help="show kept sessions").set_defaults(fn=cmd_ls)
+    s = sub.add_parser("ls", help="show kept sessions")
+    s.add_argument("--json", action="store_true",
+                   help="machine-readable, with session titles and pids")
+    s.set_defaults(fn=cmd_ls)
     sub.add_parser("sync", help="record sessions opened on kept hosts").set_defaults(fn=cmd_sync)
 
     s = sub.add_parser("restore", help="bring back every kept session")
     s.add_argument("--no-wait", action="store_true", help="skip waiting for the network")
+    s.add_argument("--dry-run", action="store_true",
+                   help="show what would be started, re-queued and released; change nothing")
     s.set_defaults(fn=cmd_restore)
 
     sub.add_parser("attach", help="attach to the crc tmux session").set_defaults(fn=cmd_attach)
@@ -316,6 +424,9 @@ def main():
     s.add_argument("dir", nargs="?")
     s.add_argument("--force", action="store_true")
     s.set_defaults(fn=cmd_release)
+
+    sub.add_parser("stale", help="list stale registrations in every folder"
+                   ).set_defaults(fn=cmd_stale)
 
     sub.add_parser("doctor", help="check prerequisites").set_defaults(fn=cmd_doctor)
 

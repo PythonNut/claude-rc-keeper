@@ -169,3 +169,41 @@ class Deregister(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ServerSessions(unittest.TestCase):
+
+    def test_parse(self):
+        body = {"data": [{"id": "cse_A", "environment_id": "env_1",
+                          "session_status": "idle", "title": "x"},
+                         {"id": "session_B", "session_status": "archived"},
+                         {"no_id": True}]}
+        self.assertEqual(bridge.parse_server_sessions(body),
+                         [bridge.ServerSession("session_A", "env_1", "idle", "x"),
+                          bridge.ServerSession("session_B", "", "archived", "")])
+
+
+class Pointers(unittest.TestCase):
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.old = os.environ.get("CLAUDE_CONFIG_DIR")
+        os.environ["CLAUDE_CONFIG_DIR"] = self.tmp.name
+
+    def tearDown(self):
+        if self.old is None:
+            del os.environ["CLAUDE_CONFIG_DIR"]
+        else:
+            os.environ["CLAUDE_CONFIG_DIR"] = self.old
+        self.tmp.cleanup()
+
+    def test_all_pointers_and_cwd(self):
+        bridge.write_pointer("/a/b", "session_1", "env_1")
+        pdir = os.path.dirname(bridge.pointer_path("/a/b"))
+        with open(os.path.join(pdir, "t.jsonl"), "w") as f:
+            f.write('{"type":"mode"}\nnot json\n{"cwd":"/a/b"}\n')
+        os.makedirs(os.path.join(self.tmp.name, "projects", "-empty"))
+        found = bridge.all_pointers()
+        self.assertEqual([(p, x.environment_id) for p, x in found], [(pdir, "env_1")])
+        self.assertEqual(bridge.project_cwd(pdir), "/a/b")
+        self.assertIsNone(bridge.project_cwd(os.path.join(self.tmp.name, "projects", "-empty")))

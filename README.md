@@ -60,11 +60,18 @@ So restore:
    the call the client uses to adopt its own sessions.
 
 The pointer only ever names one session, so crc remembers the rest itself.
-`crc sync` records each live host's sessions from its child processes. A
-user timer runs it every 3 minutes, and `adopt` and `restore` run it too. It
-only adds to the list, because a session parked idle has no child process. A
-session leaves the list when the server refuses to re-queue it (archived or
-expired).
+`crc sync` asks the server for the account's sessions (`GET /v1/sessions`, the
+list `claude --teleport` uses), each of which names the environment it is
+bound to. It keeps every session on a kept host's environment, including ones
+parked idle, and drops the ones the server reports archived. It also adds the
+sessions a live host's child processes are serving. A user timer runs it every
+3 minutes, and `adopt` and `restore` run it too (restore before it starts
+anything).
+
+If the server can't be reached, sync falls back to child processes only and
+removes nothing, since an idle session has no process. `crc ls` then flags the
+host as possibly missing sessions. A session also leaves the list when the
+server refuses to re-queue it.
 
 ## Install
 
@@ -81,12 +88,18 @@ Without it, restore runs when you log in.
     crc new [DIR] [--name N] [-- FLAGS]  start `claude rc` in DIR and keep it
     crc new -i [DIR] [--name N]          same, as a terminal `claude --remote-control`
     crc adopt [DIR] [--pid N]            keep a session already running there
-    crc ls                               state of each kept folder
+    crc ls [--json]                      state of each kept folder; --json adds
+                                         session titles, status and pids
     crc sync                             record sessions opened on kept hosts
     crc attach                           look at the sessions (tmux -L crc)
     crc rm DIR                           stop keeping DIR; stops it and releases it
     crc release [DIR]                    just the stale-registration fix
-    crc restore                          what the unit runs at start
+    crc stale                            list stale registrations in every folder
+    crc restore [--dry-run]              what the unit runs at start; --dry-run
+                                         shows what it would start, re-queue and
+                                         release, and changes nothing
+    crc doctor                           check what restore depends on, including
+                                         PATH in a clean login shell
 
 There is one kept session per folder, because the server allows only one rc
 host per folder. `adopt` prefers an rc host and otherwise takes a terminal
@@ -98,12 +111,13 @@ on every resume. Don't pass `--spawn=session`: it makes the host
 single-session, so the other sessions can't be re-queued onto it.
 
 Sessions you start from claude.ai/code on a kept host are picked up by the
-next sync. One opened less than a sync interval before a crash can be missed.
+next sync, or at the latest by the sync restore runs first.
 
 ## Safety
 
 The only destructive step is deleting a server registration. Restore does it
-only when **all** of these hold:
+only when **all** of these hold (`crc restore --dry-run` shows whether it
+would):
 
 - the folder's bridge pointer names it,
 - the process that registered it is gone, checked by pid *and* start time, so a
@@ -121,7 +135,8 @@ kept session's own environment without `--force`.
 `~/.claude` layout (including the per-process `sessions/` registry), the
 bridge-pointer schema and the client's choice to reuse its environment, the
 OAuth credentials file, and the environments API (deregister and
-`bridge/reconnect`) with its `anthropic-beta` header. They are all in that
+`bridge/reconnect`) with its `anthropic-beta` header, and the session list
+(`/v1/sessions`, with its own beta header). They are all in that
 one file. If an update changes them, the likely failure is a host that comes
 back with only its first session, or on a new environment, which `crc
 restore` logs. An

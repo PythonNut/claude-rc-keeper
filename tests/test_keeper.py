@@ -154,20 +154,96 @@ class Sync(unittest.TestCase):
 
     def test_adds_children_of_live_host_only(self):
         e = dict(ENTRY, sessions=[])
-        self.assertEqual(keeper.sync_one("/d", e, self.live), ["session_EXTRA"])
+        self.assertEqual(keeper.sync_one("/d", e, self.live), (["session_EXTRA"], []))
         self.assertEqual(e["sessions"], ["session_EXTRA"])
+        self.assertEqual(e["synced_from"], "processes")
 
-    def test_never_removes(self):
+    def test_never_removes_without_the_server(self):
         e = dict(ENTRY, sessions=["session_IDLE"])
         keeper.sync_one("/d", e, self.live)
         self.assertEqual(e["sessions"], ["session_EXTRA", "session_IDLE"])
 
     def test_host_on_another_environment_is_not_ours(self):
         e = dict(ENTRY, environment_id="env_ELSE", sessions=[])
-        self.assertEqual(keeper.sync_one("/d", e, self.live), [])
+        self.assertEqual(keeper.sync_one("/d", e, self.live), ([], []))
 
     def test_interactive_entries_are_skipped(self):
-        self.assertEqual(keeper.sync_one("/d", dict(IENTRY), self.live), [])
+        self.assertEqual(keeper.sync_one("/d", dict(IENTRY), self.live), ([], []))
+
+    def test_server_adds_idle_sessions_on_our_environment(self):
+        e = dict(ENTRY, sessions=[])
+        server = [srv("session_KEEP"), srv("session_PARKED", status="idle"),
+                  srv("session_OTHER", env="env_OTHER")]
+        self.assertEqual(keeper.sync_one("/d", e, [], server), (["session_PARKED"], []))
+        self.assertEqual(e["sessions"], ["session_PARKED"])
+        self.assertEqual(e["synced_from"], "server")
+
+    def test_server_drops_archived(self):
+        e = dict(ENTRY, sessions=["session_GONE", "session_UNSEEN"])
+        server = [srv("session_GONE", status="archived")]
+        self.assertEqual(keeper.sync_one("/d", e, [], server), ([], ["session_GONE"]))
+        # Not listed at all is not proof of anything: kept.
+        self.assertEqual(e["sessions"], ["session_UNSEEN"])
+
+    def test_archived_child_is_not_added(self):
+        e = dict(ENTRY, sessions=[])
+        server = [srv("session_EXTRA", status="archived")]
+        self.assertEqual(keeper.sync_one("/d", e, self.live, server), ([], []))
+
+    def test_server_works_with_the_host_down(self):
+        e = dict(ENTRY, sessions=[])
+        os.unlink(os.path.join(self.tmp.name, "projects", "-d", bridge.POINTER))
+        self.assertEqual(keeper.sync_one("/d", e, self.live, [srv("session_X")]),
+                         (["session_X"], []))
+
+
+def srv(sid, env="env_KEEP", status="idle"):
+    return bridge.ServerSession(sid, env, status, "t")
+
+
+class DryRun(unittest.TestCase):
+    """restore_one(dry_run=True) must touch nothing."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.old = os.environ.get("CLAUDE_CONFIG_DIR")
+        os.environ["CLAUDE_CONFIG_DIR"] = self.tmp.name
+        self.saved = (tmuxctl.window_for, keeper.start, bridge.deregister)
+        tmuxctl.window_for = lambda d: None
+        keeper.start = bridge.deregister = self.fail
+
+    def tearDown(self):
+        tmuxctl.window_for, keeper.start, bridge.deregister = self.saved
+        if self.old is None:
+            del os.environ["CLAUDE_CONFIG_DIR"]
+        else:
+            os.environ["CLAUDE_CONFIG_DIR"] = self.old
+        self.tmp.cleanup()
+
+    def fail(self, *a, **k):
+        raise AssertionError("dry run acted")
+
+    def test_release_and_launch_are_only_described(self):
+        d = os.path.join(self.tmp.name, "projects", "-d")
+        os.makedirs(d)
+        with open(os.path.join(d, bridge.POINTER), "w") as f:
+            json.dump({"sessionId": "session_OLD", "environmentId": "env_OLD",
+                       "pid": 0}, f)
+        e = dict(ENTRY, sessions=["session_TWO"])
+        before = json.dumps(e, sort_keys=True)
+        lines = []
+        self.assertTrue(keeper.restore_one("/d", e, log=lines.append, dry_run=True))
+        self.assertEqual(json.dumps(e, sort_keys=True), before)
+        text = "\n".join(lines)
+        self.assertIn("would release stale registration env_OLD", text)
+        self.assertIn("would re-queue session_TWO", text)
+        with open(os.path.join(d, bridge.POINTER)) as f:
+            self.assertIn("env_OLD", f.read())
+
+    def test_interactive(self):
+        lines = []
+        keeper.restore_interactive("/d", dict(IENTRY), lines.append, dry_run=True)
+        self.assertIn("would run claude --resume", lines[0])
 
 
 class Registry(unittest.TestCase):
