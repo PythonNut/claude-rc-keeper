@@ -391,19 +391,31 @@ def cmd_stale(a):
         print("no stale registrations recorded")
 
 
-def login_shell_finds(names):
-    """Which of names a login shell finds, started the way the unit starts
-    one: the systemd user manager's environment, then $SHELL -lc."""
-    env = {"HOME": os.path.expanduser("~"), "USER": os.environ.get("USER", ""),
-           "LOGNAME": os.environ.get("LOGNAME", os.environ.get("USER", "")),
-           "SHELL": tmuxctl.login_shell()}
+def unit_path():
+    """The PATH the unit runs with: its own Environment= if it sets one, else
+    the user manager's. None if neither can be read."""
+    r = subprocess.run(["systemctl", "--user", "show", "-p", "Environment", "--value",
+                        tmuxctl.UNIT], capture_output=True, text=True)
+    for word in r.stdout.split():
+        if word.startswith("PATH="):
+            return word[len("PATH="):]
     r = subprocess.run(["systemctl", "--user", "show-environment"],
                        capture_output=True, text=True)
     for line in r.stdout.splitlines():
-        k, _, v = line.partition("=")
-        if k in ("PATH", "HOME", "USER", "LOGNAME", "LANG") and v:
-            env[k] = v
-    env.setdefault("PATH", "/usr/local/bin:/usr/bin:/bin")
+        if line.startswith("PATH="):
+            return line[len("PATH="):]
+    return None
+
+
+def login_shell_finds(names):
+    """Which of names a login shell finds, started the way the unit starts
+    one: the unit's PATH, then $SHELL -lc."""
+    env = {"HOME": os.path.expanduser("~"), "USER": os.environ.get("USER", ""),
+           "LOGNAME": os.environ.get("LOGNAME", os.environ.get("USER", "")),
+           "SHELL": tmuxctl.login_shell(),
+           "PATH": unit_path() or "/usr/local/bin:/usr/bin:/bin"}
+    if "LANG" in os.environ:
+        env["LANG"] = os.environ["LANG"]
     script = "; ".join(f'command -v {n} >/dev/null && echo {n}' for n in names)
     try:
         r = subprocess.run([env["SHELL"], "-lc", script], env=env, text=True,
@@ -423,8 +435,14 @@ def cmd_doctor(a):
 
     check("claude on PATH", shutil.which("claude"), "install Claude Code")
     check("tmux on PATH", shutil.which("tmux"), "pacman -S tmux")
-    # What restore actually depends on: kept sessions start through a login
-    # shell in the unit's environment, not this terminal's.
+    # What restore actually depends on: crc itself runs with the unit's PATH,
+    # and kept sessions start through a login shell from there.
+    up = unit_path()
+    missing = [n for n in ("python3", "tmux", "systemctl")
+               if up is None or not shutil.which(n, path=up)]
+    check("python3, tmux and systemctl on the unit's PATH (how restore and sync run)",
+          not missing, f"not found there: {', '.join(missing)}; `make install` again "
+          f"from a shell that has them, then systemctl --user daemon-reload")
     found = login_shell_finds(["claude", "crc"])
     shell = os.path.basename(tmuxctl.login_shell())
     profile = {"zsh": "~/.zprofile", "bash": "~/.bash_profile"}.get(shell, "~/.profile")

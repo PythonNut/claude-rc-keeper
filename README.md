@@ -91,6 +91,12 @@ refused: exit it first.
     systemctl --user enable claude-rc-keeper.service claude-rc-keeper-sync.timer
     crc doctor
 
+The units run with the PATH `make install` was run with (minus `/nix/store`
+entries), not the systemd user manager's, which on NixOS has nothing but
+systemd in it. So install from a shell where `python3`, `tmux` and `claude`
+are found, and re-run `make install` if they move. `crc doctor` checks this.
+On NixOS without `make`, `nix-shell -p gnumake --run 'make install'` works.
+
 To resume at boot before you log in, it also needs `loginctl enable-linger`.
 Without it, restore runs when you log in.
 

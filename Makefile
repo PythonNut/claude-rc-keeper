@@ -8,6 +8,13 @@ LIBDIR  ?= $(PREFIX)/lib/claude-rc-keeper
 # $(XDG_DATA_HOME)/systemd/user is on systemd's user unit search path, so the
 # ~/.local default needs no extra configuration.
 UNITDIR ?= $(PREFIX)/share/systemd/user
+# The units run with the systemd user manager's PATH, which can be bare: on
+# NixOS it holds only systemd itself, so not even python3 or sh is found.
+# They get the PATH `make install` ran with instead, less /nix/store entries
+# (a nix-shell's, which garbage collection removes) and with BINDIR first.
+UNITPATH := $(shell printf '%s\n' "$(BINDIR)" $$(printf '%s' "$$PATH" | tr ':' ' ') \
+              | grep -v -e '^/nix/store/' -e '^$$' | awk '!seen[$$0]++' | paste -sd: \
+              | sed 's/%/%%/g')
 UNIT    := claude-rc-keeper.service
 SYNC    := claude-rc-keeper-sync
 MODULES := bridge.py keeper.py tmuxctl.py
@@ -29,9 +36,9 @@ install:
 	sed -i 's|^LIBDIR = .*|LIBDIR = "$(LIBDIR)"|' $(DESTDIR)$(BINDIR)/crc
 	@# tmux by absolute path: a user unit runs with systemd's minimal PATH.
 	@tmux_path=$$(command -v tmux || echo /usr/bin/tmux); \
-	sed -e 's|@BINDIR@|$(BINDIR)|g' -e "s|@TMUX@|$$tmux_path|g" \
+	sed -e 's|@BINDIR@|$(BINDIR)|g' -e "s|@TMUX@|$$tmux_path|g" -e 's|@PATH@|$(UNITPATH)|g' \
 	    systemd/$(UNIT).in > $(DESTDIR)$(UNITDIR)/$(UNIT)
-	sed -e 's|@BINDIR@|$(BINDIR)|g' systemd/$(SYNC).service.in \
+	sed -e 's|@BINDIR@|$(BINDIR)|g' -e 's|@PATH@|$(UNITPATH)|g' systemd/$(SYNC).service.in \
 	    > $(DESTDIR)$(UNITDIR)/$(SYNC).service
 	install -m 0644 systemd/$(SYNC).timer $(DESTDIR)$(UNITDIR)/$(SYNC).timer
 	@if [ -z "$(DESTDIR)" ]; then \

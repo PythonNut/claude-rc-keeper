@@ -1,8 +1,9 @@
-# Records sessions opened on kept rc hosts since the last run, so a crash
-# loses at most one interval's worth. Local only: reads /proc and ~/.claude.
+# Records the sessions on each kept rc host, from the server's session list
+# and the hosts' child processes, so a restore brings them all back.
 [Unit]
 Description=Record sessions on kept Claude Code remote-control hosts
 
 [Service]
 Type=oneshot
+Environment="PATH=@PATH@"
 ExecStart=@BINDIR@/crc sync
