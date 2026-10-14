@@ -5,9 +5,9 @@
 Description=Keep Claude Code remote-control sessions running
 
 [Service]
-# The user manager's own PATH may not even have python3 (NixOS); this is the
-# one crc was installed with. The claude sessions themselves get their PATH
-# from a login shell.
+# Only if make install was given UNITPATH (NixOS, where the user manager's
+# PATH lacks python3 and tmux); otherwise this line is dropped. The claude
+# sessions themselves get their PATH from a login shell.
 Environment="PATH=@PATH@"
 # tmux daemonizes its server; systemd tracks it as the main process, and every
 # claude it hosts lands in this unit's cgroup.

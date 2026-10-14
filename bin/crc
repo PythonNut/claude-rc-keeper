@@ -441,8 +441,8 @@ def cmd_doctor(a):
     missing = [n for n in ("python3", "tmux", "systemctl")
                if up is None or not shutil.which(n, path=up)]
     check("python3, tmux and systemctl on the unit's PATH (how restore and sync run)",
-          not missing, f"not found there: {', '.join(missing)}; `make install` again "
-          f"from a shell that has them, then systemctl --user daemon-reload")
+          not missing, f"not found there: {', '.join(missing)}; `make install UNITPATH=...` "
+          f"with a PATH that has them (see README), then systemctl --user daemon-reload")
     found = login_shell_finds(["claude", "crc"])
     shell = os.path.basename(tmuxctl.login_shell())
     profile = {"zsh": "~/.zprofile", "bash": "~/.bash_profile"}.get(shell, "~/.profile")
