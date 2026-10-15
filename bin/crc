@@ -15,7 +15,7 @@
     crc stale                           list stale registrations in every folder
     crc doctor                          check what restore depends on
 
-Kept sessions run in windows of a private tmux server (`tmux -L crc`), which
+Kept sessions run in windows of a private tmux server (`crc attach`), which
 the claude-rc-keeper user unit owns. After a reboot the unit resumes each one:
 an rc host on its old environment with every session it was serving, first
 releasing any registration another dead host left on the folder (the "This
@@ -228,7 +228,7 @@ def cmd_attach(a):
     if not tmuxctl.session_up():
         die("no crc tmux session; `crc restore` or `crc new` starts one")
     env = {k: v for k, v in os.environ.items() if k != "TMUX"}
-    os.execvpe("tmux", ["tmux", "-L", tmuxctl.SOCKET, "attach", "-t",
+    os.execvpe("tmux", ["tmux", "-S", tmuxctl.socket(), "attach", "-t",
                         f"={tmuxctl.SESSION}"], env)
 
 

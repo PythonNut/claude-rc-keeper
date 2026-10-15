@@ -1,8 +1,13 @@
 """The tmux server that hosts kept sessions.
 
-A private server on its own socket (`tmux -L crc`), so nothing here can touch
-the tmux you work in, and so the systemd unit can own the whole server: every
-`claude rc` it hosts lands in the unit's cgroup and is stopped with it.
+A private server on its own socket, so nothing here can touch the tmux you
+work in, and so the systemd unit can own the whole server: every `claude rc`
+it hosts lands in the unit's cgroup and is stopped with it.
+
+The socket is named by full path ($XDG_RUNTIME_DIR/crc.tmux, %t/crc.tmux in
+the unit), not with `-L`: `-L` puts it under $TMUX_TMPDIR, which login shells
+may set (NixOS does) while systemd units don't, and then crc and the unit
+would each be looking at a different server.
 
 Windows are identified by a user option, @crc_dir, holding the folder they
 serve -- not by name, which the user is free to change.
@@ -13,7 +18,8 @@ import shutil
 import subprocess
 from typing import NamedTuple
 
-SOCKET = "crc"
+SOCKET_NAME = "crc.tmux"
+LEGACY_NAME = "crc"         # `tmux -L crc`, which crc used up to db169ec
 SESSION = "crc"
 UNIT = "claude-rc-keeper.service"
 
@@ -26,8 +32,63 @@ class Window(NamedTuple):
     name: str
 
 
+def runtime_dir(env=None, uid=None):
+    """Where the socket lives: what systemd calls %t for the user manager."""
+    env = os.environ if env is None else env
+    uid = os.getuid() if uid is None else uid
+    d = env.get("XDG_RUNTIME_DIR")
+    if d and os.path.isdir(d):
+        return d
+    d = f"/run/user/{uid}"
+    if os.path.isdir(d):
+        return d
+    d = f"/tmp/tmux-{uid}"
+    os.makedirs(d, mode=0o700, exist_ok=True)
+    return d
+
+
+def legacy_sockets(env=None, uid=None):
+    """Where `tmux -L crc` may have put the socket, in a unit or a shell."""
+    env = os.environ if env is None else env
+    uid = os.getuid() if uid is None else uid
+    dirs = [env.get("TMUX_TMPDIR") or "/tmp", "/tmp", env.get("XDG_RUNTIME_DIR")]
+    out = []
+    for d in dirs:
+        if d:
+            p = os.path.join(d, f"tmux-{uid}", LEGACY_NAME)
+            if p not in out:
+                out.append(p)
+    return out
+
+
+def _serving(path):
+    if not os.path.exists(path):
+        return False
+    r = subprocess.run(["tmux", "-S", path, "has-session", "-t", f"={SESSION}"],
+                       capture_output=True, text=True)
+    return r.returncode == 0
+
+
+_socket = None
+
+
+def socket():
+    """The socket to use. A server still running on an old `-L crc` socket is
+    used until it next starts, rather than leaving its sessions unseen."""
+    global _socket
+    if _socket is None:
+        new = os.path.join(runtime_dir(), SOCKET_NAME)
+        _socket = new
+        if not _serving(new):
+            for old in legacy_sockets():
+                if _serving(old):
+                    _socket = old
+                    break
+    return _socket
+
+
 def tmux(*args, check=True):
-    r = subprocess.run(["tmux", "-L", SOCKET, *args],
+    r = subprocess.run(["tmux", "-S", socket(), *args],
                        capture_output=True, text=True)
     if check and r.returncode != 0:
         raise RuntimeError(f"tmux {' '.join(args)}: {r.stderr.strip()}")

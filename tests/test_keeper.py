@@ -313,3 +313,21 @@ class Registry(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class Socket(unittest.TestCase):
+    """The unit and an interactive crc must name the same socket."""
+
+    def test_runtime_dir_ignores_tmux_tmpdir(self):
+        with tempfile.TemporaryDirectory() as d:
+            env = {"XDG_RUNTIME_DIR": d, "TMUX_TMPDIR": "/elsewhere"}
+            self.assertEqual(tmuxctl.runtime_dir(env, 1000), d)
+
+    def test_missing_runtime_dir_falls_back(self):
+        got = tmuxctl.runtime_dir({"XDG_RUNTIME_DIR": "/no/such/dir"}, os.getuid())
+        self.assertIn(got, (f"/run/user/{os.getuid()}", f"/tmp/tmux-{os.getuid()}"))
+
+    def test_legacy_sockets_cover_unit_and_shell(self):
+        env = {"TMUX_TMPDIR": "/run/user/1000", "XDG_RUNTIME_DIR": "/run/user/1000"}
+        self.assertEqual(tmuxctl.legacy_sockets(env, 1000),
+                         ["/run/user/1000/tmux-1000/crc", "/tmp/tmux-1000/crc"])

@@ -2,7 +2,8 @@
 
 Keeps Claude Code remote-control sessions (`claude rc`) running across reboots.
 
-Kept sessions run in windows of a private tmux server (`tmux -L crc`) owned by a
+Kept sessions run in windows of a private tmux server (socket
+`$XDG_RUNTIME_DIR/crc.tmux`; `crc attach` opens it) owned by a
 systemd user unit. When the unit starts, it resumes each one. It handles two
 kinds:
 
@@ -111,7 +112,7 @@ Without it, restore runs when you log in.
     crc ls [--json]                      state of each kept folder; --json adds
                                          session titles, status and pids
     crc sync                             record sessions opened on kept hosts
-    crc attach                           look at the sessions (tmux -L crc)
+    crc attach                           look at the sessions (the crc tmux server)
     crc rm DIR                           stop keeping DIR; stops it and releases it
     crc release [DIR]                    just the stale-registration fix
     crc move OLD NEW [--trust]           carry a kept session to a moved folder
