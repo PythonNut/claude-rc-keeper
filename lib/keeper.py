@@ -22,6 +22,7 @@ without tmux, processes, or the network.
 """
 import json
 import os
+import re
 import socket
 import tempfile
 import time
@@ -37,6 +38,14 @@ ALREADY_SERVED = "already served"
 TRUST_PROMPT = "Quick safety check"
 TRUST_MENU_YES = "Yes, I trust this folder"
 TRUST_DELAY = 2.0
+# What `claude rc` prints instead of the prompt where it cannot ask: with no
+# terminal, and on some versions (2.1.281) even in one. It then exits.
+NOT_TRUSTED = "Workspace not trusted"
+# `claude rc` in a git repo with no --spawn asks this, and waits forever.
+SPAWN_PROMPT = "Spawn mode for this project"
+SPAWN_DEFAULT = "--spawn=same-dir"
+# The last line of a screen waiting on a question: "[y/N]", "Choose [1/2] ...".
+PROMPT_LINE = re.compile(r"\[\w+(?:/\w+)+\][^\[\]]{0,40}$")
 
 
 def state_dir():
@@ -80,6 +89,7 @@ RUNNING = "running"          # our window has it; nothing to do
 ELSEWHERE = "elsewhere"      # its host is alive outside crc; leave it alone
 OCCUPIED = "occupied"        # a different live host serves the folder
 RELEASE = "release"          # a dead host's registration blocks it; release, then launch
+STUCK = "stuck"              # our window is up but never registered (at a prompt?)
 LAUNCH = "launch"            # nothing in the way
 
 
@@ -148,9 +158,61 @@ def move_check(old, new, entry, old_alive, new_kept, new_pointer, new_alive):
     return None
 
 
+def waiting_at(screen):
+    """The question a pane is sitting at, or None."""
+    lines = [ln.strip() for ln in screen.splitlines() if ln.strip()]
+    if TRUST_PROMPT in screen or TRUST_MENU_YES in screen:
+        return "Claude Code's trust prompt"
+    if SPAWN_PROMPT in screen:
+        return "claude rc's spawn-mode prompt"
+    if lines and PROMPT_LINE.search(lines[-1]):
+        return f"a prompt: {lines[-1]}"
+    return None
+
+
+def stuck(directory, entry, window):
+    """Why a live crc window is not serving, or None if it is (or is not live).
+    A host waiting at a question is up but never registered, and nobody can
+    reach it from claude.ai."""
+    if window is None or window.dead:
+        return None
+    if kind(entry) == "interactive":
+        if interactive_started(window) is not None:
+            return None
+    elif rc_started(directory)(window) is not None:
+        return None
+    q = waiting_at(tmuxctl.capture(window.id, lines=20))
+    return f"waiting at {q}" if q else "up but not registered with the server"
+
+
+def unstick(directory, entry, log, dry_run=False):
+    """The folder's crc window, or None after replacing one that is stuck:
+    restore starts afresh rather than call it running."""
+    w = tmuxctl.window_for(directory)
+    why = stuck(directory, entry, w)
+    if why is None:
+        return w
+    log(f"{directory}: window {w.id} is {why}; {'would replace' if dry_run else 'replacing'} it")
+    if not dry_run:
+        tmuxctl.kill(w.id)
+    return None
+
+
+def untrusted(directory, said=None):
+    """The error for a folder Claude Code has not been told to trust. The fix
+    is the last line, which is what `crc ls` shows."""
+    return ((f"claude said: {said}\n" if said else "")
+            + f"untrusted: Claude Code does not trust {directory} yet. Fix: run "
+              f"`claude` there, choose \"{TRUST_MENU_YES}\", exit it, then "
+              f"`crc restore` (crc new/move --trust do this themselves)")
+
+
 def state_of(directory, entry):
     """(action, detail) for one kept folder, as things stand right now."""
     window = tmuxctl.window_for(directory)
+    why = stuck(directory, entry, window)
+    if why is not None:
+        return STUCK, why
     if kind(entry) == "interactive":
         return plan_interactive(entry, bridge.live_sessions(), window)
     pointer = bridge.read_pointer(directory)
@@ -214,28 +276,53 @@ def start(directory, name, argv, confirm, timeout=60, trust=False):
     Returns (window_id, result, error), where result is whatever confirm
     returned and error is the pane's last output on failure. If Claude Code
     asks whether to trust the folder, trust=True answers yes, once; otherwise
-    the launch fails at once rather than waiting out the timeout.
+    the launch fails at once rather than waiting out the timeout. Where
+    `claude rc` refuses outright instead of asking, trust=True accepts the
+    prompt an interactive `claude` still shows, then launches again.
     """
+    wid, r, err = launch_and_wait(directory, name, argv, confirm, timeout, trust)
+    if err is not None and trust and NOT_TRUSTED in err:
+        err = pretrust(directory, name)
+        if err is None:
+            wid, r, err = launch_and_wait(directory, name, argv, confirm, timeout, trust)
+    return wid, r, err
+
+
+def launch_and_wait(directory, name, argv, confirm, timeout, trust):
     tmuxctl.ensure_session()
     old = tmuxctl.window_for(directory)
     if old is not None:
         tmuxctl.kill(old.id)
     wid = tmuxctl.launch(directory, name, argv)
     deadline = time.monotonic() + timeout
-    answered = seen = None
+    answered = seen = waiting = None
     while time.monotonic() < deadline:
         time.sleep(0.5)
         w = tmuxctl.get(wid)
         if w is None:
             return wid, None, "window vanished"
         if w.dead:
-            return wid, None, tmuxctl.capture(wid) or "claude exited"
+            out = tmuxctl.capture(wid)
+            if NOT_TRUSTED in out:
+                said = next(ln.strip() for ln in out.splitlines() if NOT_TRUSTED in ln)
+                return wid, None, untrusted(directory, said)
+            return wid, None, out or "claude exited"
         r = confirm(w)
         if r is not None:
             return wid, r, None
         screen = tmuxctl.capture(wid, lines=20)
         if TRUST_PROMPT not in screen:
-            continue
+            q = waiting_at(screen)
+            if q is None:
+                waiting = None
+                continue
+            # A question we have no answer for: it would wait forever, and
+            # a host waiting there serves nothing.
+            waiting = waiting or time.monotonic()
+            if time.monotonic() - waiting < 5:
+                continue
+            tmuxctl.kill(wid)
+            return wid, None, f"stuck: claude stopped at {q}, which crc cannot answer:\n{screen}"
         if trust and answered is None:
             # The client ignores an answer that comes too soon after the
             # question (keys typed ahead of it), so let it sit a moment.
@@ -251,10 +338,41 @@ def start(directory, name, argv, confirm, timeout=60, trust=False):
         tmuxctl.kill(wid)
         if answered is not None:
             return wid, None, f"answered Claude Code's trust prompt, but it stayed:\n{screen}"
-        return wid, None, (f"Claude Code asks whether to trust {directory}; pass "
-                           f"--trust to accept it, or run `claude` there once and "
-                           f"accept, then retry")
+        return wid, None, untrusted(directory)
     return wid, None, f"no registration after {timeout}s:\n{tmuxctl.capture(wid)}"
+
+
+def pretrust(directory, name, timeout=30):
+    """Accept the trust prompt of an interactive `claude` in directory, then
+    close it. Returns an error, or None once the prompt has gone."""
+    tmuxctl.ensure_session()
+    old = tmuxctl.window_for(directory)
+    if old is not None:
+        tmuxctl.kill(old.id)
+    wid = tmuxctl.launch(directory, name, ["claude"])
+    try:
+        deadline = time.monotonic() + timeout
+        answered = seen = None
+        while time.monotonic() < deadline:
+            time.sleep(0.5)
+            w = tmuxctl.get(wid)
+            if w is None or w.dead:
+                return untrusted(directory, "claude exited at its trust prompt")
+            screen = tmuxctl.capture(wid, lines=30)
+            if TRUST_MENU_YES not in screen:
+                if answered is not None:
+                    return None
+                continue
+            if answered is None:
+                seen = seen or time.monotonic()
+                if time.monotonic() - seen >= TRUST_DELAY:
+                    answer_trust(wid, screen)
+                    answered = time.monotonic()
+            elif time.monotonic() - answered > 5:
+                return f"answered Claude Code's trust prompt, but it stayed:\n{screen}"
+        return untrusted(directory, f"no trust prompt from `claude` within {timeout}s")
+    finally:
+        tmuxctl.kill(wid)
 
 
 def resume_argv(entry):
@@ -264,7 +382,15 @@ def resume_argv(entry):
     if kind(entry) == "interactive":
         return ["claude", "--resume", entry["transcript_id"], "--remote-control",
                 *entry.get("args", [])]
-    return ["claude", "rc", *entry.get("args", [])]
+    return rc_argv(entry.get("args", []))
+
+
+def rc_argv(args, name=None):
+    """`claude rc` with --spawn spelled out unless args already choose one:
+    in a git repo it otherwise stops to ask, and nobody is there to answer."""
+    spawn = [] if any(a == "--spawn" or a.startswith("--spawn=") for a in args) \
+        else [SPAWN_DEFAULT]
+    return ["claude", "rc", *(["--name", name] if name else []), *spawn, *args]
 
 
 def sync_one(directory, entry, live=None, server=None):
@@ -358,7 +484,9 @@ def finish(directory, entry, wid, err, log):
         entry["last_status"], entry["last_error"] = "running", None
         log(f"{directory}: running in {wid}")
         return True
-    status = "blocked" if ALREADY_SERVED in err else "failed"
+    status = ("blocked" if ALREADY_SERVED in err else
+              "untrusted" if "untrusted: " in err else
+              "stuck" if err.startswith("stuck: ") else "failed")
     entry["last_status"], entry["last_error"] = status, err.strip()[-2000:]
     log(f"{directory}: {status}:\n{err}")
     return False
@@ -366,7 +494,7 @@ def finish(directory, entry, wid, err, log):
 
 def restore_interactive(directory, entry, log, dry_run=False, trust=False):
     action, detail = plan_interactive(entry, bridge.live_sessions(),
-                                      tmuxctl.window_for(directory))
+                                      unstick(directory, entry, log, dry_run))
     if dry_run:
         if action == RUNNING:
             log(f"{directory}: running in {detail}; nothing to do")
@@ -422,7 +550,7 @@ def restore_one(directory, entry, log=print, dry_run=False, trust=False):
         return restore_interactive(directory, entry, log, dry_run, trust)
     pointer = bridge.read_pointer(directory)
     alive = pointer is not None and bridge.host_alive(pointer)
-    action, detail = plan(entry, pointer, alive, tmuxctl.window_for(directory))
+    action, detail = plan(entry, pointer, alive, unstick(directory, entry, log, dry_run))
     if dry_run:
         describe(directory, entry, action, detail, pointer, log)
         return action != OCCUPIED

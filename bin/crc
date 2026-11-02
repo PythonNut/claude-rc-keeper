@@ -64,7 +64,7 @@ def cmd_new(a):
         argv = ["claude", "--remote-control", *([a.name] if a.name else []), *a.args]
         confirm = keeper.interactive_started
     else:
-        argv = ["claude", "rc", *(["--name", a.name] if a.name else []), *a.args]
+        argv = keeper.rc_argv(a.args, a.name)
         confirm = keeper.rc_started(d)
     wid, r, err = keeper.start(d, name, argv, confirm, trust=a.trust)
     if err is not None:
@@ -125,6 +125,7 @@ STATE_TEXT = {keeper.RUNNING: "running ({})",
               keeper.ELSEWHERE: "running outside crc (pid {})",
               keeper.OCCUPIED: "blocked: another live host (pid {})",
               keeper.RELEASE: "stopped; stale registration {} to release",
+              keeper.STUCK: "STUCK, not serving: window {}",
               keeper.LAUNCH: "stopped"}
 
 
@@ -473,6 +474,14 @@ def cmd_doctor(a):
                             capture_output=True, text=True).stdout.strip()
     check("lingering on (restore at boot, before login)", linger == "yes",
           "loginctl enable-linger  (without it, restore waits for your login)")
+    for d, e in sorted(keeper.load().items()):
+        action, detail = keeper.state_of(d, e)
+        last = (e.get("last_error") or "").splitlines()[-1:] or [""]
+        if action == keeper.STUCK:
+            check(f"{d} serving", False, f"its window is {detail}; `crc attach` to "
+                  f"look, or `crc restore` to start it again")
+        elif action not in (keeper.RUNNING, keeper.ELSEWHERE) and "untrusted: " in last[0]:
+            check(f"{d} trusted by Claude Code", False, last[0].split("untrusted: ", 1)[1])
     return 0 if ok else 1
 
 

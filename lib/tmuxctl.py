@@ -173,7 +173,7 @@ def launch(directory, name, argv):
 
 
 def capture(window_id, lines=40):
-    r = tmux("capture-pane", "-p", "-t", window_id, "-S", f"-{lines}", check=False)
+    r = tmux("capture-pane", "-p", "-J", "-t", window_id, "-S", f"-{lines}", check=False)
     return r.stdout.strip()
 
 

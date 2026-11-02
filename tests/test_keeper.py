@@ -308,7 +308,61 @@ class Registry(unittest.TestCase):
         """--session-id would force single-session mode and strand the rest."""
         e = dict(ENTRY, args=["--permission-mode", "auto"])
         self.assertEqual(keeper.resume_argv(e),
-                         ["claude", "rc", "--permission-mode", "auto"])
+                         ["claude", "rc", "--spawn=same-dir", "--permission-mode", "auto"])
+
+
+class Prompts(unittest.TestCase):
+    """A host left at a question never registers; crc must say so, not "running"."""
+
+    SPAWN = ("Spawn mode for this project:\n  [1] same-dir\n  [2] worktree\n"
+             "Choose [1/2] (default: 1):")
+
+    def test_rc_argv_spells_out_spawn(self):
+        self.assertEqual(keeper.rc_argv([], "n"),
+                         ["claude", "rc", "--name", "n", "--spawn=same-dir"])
+
+    def test_rc_argv_keeps_a_chosen_spawn(self):
+        for args in (["--spawn", "worktree"], ["--spawn=session"]):
+            self.assertEqual(keeper.rc_argv(args), ["claude", "rc", *args])
+
+    def test_waiting_at(self):
+        self.assertIn("spawn-mode", keeper.waiting_at(self.SPAWN))
+        self.assertIn("trust", keeper.waiting_at("Quick safety check: ...\nTrust /d? [y/N]"))
+        self.assertIn("[y/N]", keeper.waiting_at("Overwrite it? [y/N]"))
+        self.assertIsNone(keeper.waiting_at("Remote Control connected\nsession_01abc"))
+        self.assertIsNone(keeper.waiting_at(""))
+
+    def _stuck(self, screen, pointer_pid):
+        saved = tmuxctl.capture, bridge.read_pointer
+        tmuxctl.capture = lambda wid, lines=40: screen
+        bridge.read_pointer = lambda d: bridge.Pointer("s", "e", pointer_pid, "1", "/p")
+        try:
+            return keeper.stuck("/d", ENTRY, win())
+        finally:
+            tmuxctl.capture, bridge.read_pointer = saved
+
+    def test_registered_window_is_not_stuck(self):
+        self.assertIsNone(self._stuck(self.SPAWN, 1234))
+
+    def test_unregistered_window_at_prompt_is_stuck(self):
+        self.assertIn("spawn-mode", self._stuck(self.SPAWN, 999))
+
+    def test_unregistered_window_without_prompt_is_stuck(self):
+        self.assertIn("not registered", self._stuck("starting...", 999))
+
+    def test_dead_or_missing_window_is_not_stuck(self):
+        self.assertIsNone(keeper.stuck("/d", ENTRY, None))
+        self.assertIsNone(keeper.stuck("/d", ENTRY, win(dead=True)))
+
+    def test_untrusted_ends_with_the_fix(self):
+        err = keeper.untrusted("/d", "Error: Workspace not trusted.")
+        self.assertTrue(err.splitlines()[-1].startswith("untrusted: "))
+        self.assertIn("Yes, I trust this folder", err.splitlines()[-1])
+        e = dict(ENTRY)
+        keeper.finish("/d", e, "@1", err, lambda m: None)
+        self.assertEqual(e["last_status"], "untrusted")
+        keeper.finish("/d", e, "@1", "stuck: claude stopped at x", lambda m: None)
+        self.assertEqual(e["last_status"], "stuck")
 
 
 if __name__ == "__main__":

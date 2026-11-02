@@ -128,14 +128,23 @@ host per folder. `adopt` prefers an rc host and otherwise takes a terminal
 session with remote control on. An interactive session is never relaunched
 while its conversation is already open somewhere else.
 
-Claude Code asks once per folder whether to trust it, and waits for an
-answer. In a folder it hasn't been told to trust, `crc new` and `crc move`
-fail right away and say so. Pass `--trust` to have crc answer yes for you.
-`crc restore` never answers it.
+Claude Code has to be told once per folder that you trust it. Depending on
+the version, `claude rc` either asks and waits, or exits with "Workspace not
+trusted". Either way, `crc new`, `crc move` and `crc restore` fail right away
+in an untrusted folder, and `crc ls`, `crc doctor` and the restore output give
+the fix: run `claude` there and choose "Yes, I trust this folder". Pass
+`--trust` to `crc new` or `crc move` to have crc answer yes for you; when
+`claude rc` will not ask, crc answers the prompt of an interactive `claude`
+first. `crc restore` never answers it.
+
+A host waiting at any question never registers, so nobody can reach it.
+`crc ls` shows such a window as STUCK, and `crc restore` replaces it.
 
 FLAGS after `--` are passed to `claude rc` (or `claude`, with `-i`) and reused
-on every resume. Don't pass `--spawn=session`: it makes the host
-single-session, so the other sessions can't be re-queued onto it.
+on every resume. crc adds `--spawn=same-dir` unless FLAGS choose a spawn mode,
+because in a git repo `claude rc` otherwise stops to ask. Don't pass
+`--spawn=session`: it makes the host single-session, so the other sessions
+can't be re-queued onto it.
 
 Sessions you start from claude.ai/code on a kept host are picked up by the
 next sync, or at the latest by the sync restore runs first.
