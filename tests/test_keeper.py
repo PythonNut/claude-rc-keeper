@@ -487,9 +487,12 @@ class Revive(unittest.TestCase):
             self.assertIsNone(self._reason(e, (keeper.LAUNCH, None)), status)
 
     def test_no_network_leaves_them_for_the_next_try(self):
-        saved = keeper.revive_reason, keeper.wait_network, keeper.restore_one
+        saved = (keeper.revive_reason, keeper.wait_network, keeper.restore_one,
+                 tmuxctl.window_for, bridge.live_sessions)
         started, logs = [], []
-        keeper.revive_reason = lambda d, e: "it is not running"
+        keeper.revive_reason = lambda d, e, *rest: "it is not running"
+        tmuxctl.window_for = lambda d: None
+        bridge.live_sessions = lambda: []
         keeper.wait_network = lambda timeout: False
         keeper.restore_one = lambda d, e, log: started.append(d)
         try:
@@ -500,7 +503,37 @@ class Revive(unittest.TestCase):
                 self.assertTrue(keeper.revive_all({d: dict(ENTRY)}, logs.append))
                 self.assertEqual(started, [d])
         finally:
-            keeper.revive_reason, keeper.wait_network, keeper.restore_one = saved
+            (keeper.revive_reason, keeper.wait_network, keeper.restore_one,
+             tmuxctl.window_for, bridge.live_sessions) = saved
+
+    def _gone(self, entry, connection="disconnected", local="idle", t=1000.0):
+        srv = {"session_KEEP": bridge.ServerSession("session_KEEP", "", "idle", "", connection)}
+        live = [bridge.LiveSession(1234, "t", "/d", "session_KEEP", "cli", "", local)]
+        return keeper.disconnected(entry, win(), srv, live, clock=lambda: t)
+
+    def test_disconnected_terminal_host_is_timed_across_runs(self):
+        e = dict(ENTRY)
+        self.assertEqual(self._gone(e, t=1000.0), 0)
+        self.assertEqual(self._gone(e, t=1000.0 + keeper.REVIVE_GRACE), keeper.REVIVE_GRACE)
+        self.assertIsNone(self._gone(e, connection="connected"))
+        self.assertNotIn("disconnected_at", e)        # reconnecting resets the clock
+
+    def test_offline_time_does_not_count(self):
+        e = dict(ENTRY, disconnected_at=1.0)
+        srv = {"session_KEEP": bridge.ServerSession("session_KEEP", "", "idle", "",
+                                                    "disconnected")}
+        self.assertIsNone(keeper.disconnected(e, win(), srv, [], net_ok=False))
+        self.assertNotIn("disconnected_at", e)
+
+    def test_busy_session_is_never_counted_down(self):
+        e = dict(ENTRY)
+        self.assertIsNone(self._gone(e, local="busy"))
+        self.assertNotIn("disconnected_at", e)
+
+    def test_unknown_server_state_counts_as_connected(self):
+        e = dict(ENTRY, disconnected_at=1.0)
+        self.assertIsNone(keeper.disconnected(e, win(), None, []))
+        self.assertNotIn("disconnected_at", e)
 
     def test_lock_is_exclusive(self):
         with tempfile.TemporaryDirectory() as d:

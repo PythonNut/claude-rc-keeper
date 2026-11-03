@@ -4,6 +4,9 @@
     crc new [DIR] [--name N] [-i] [--trust] [-- ARGS]
                                         start `claude rc` in DIR and keep it;
                                         -i: a terminal `claude --remote-control`
+            [--resume ID] [--channel CH ...] [--accept-channels]
+                                        -i continuing conversation ID, with
+                                        development channels
     crc adopt [DIR] [--pid N]           keep a session already running in DIR
     crc ls [--json]                     show kept sessions and their state
     crc sync                            record sessions opened on kept hosts (timer)
@@ -61,14 +64,29 @@ def cmd_new(a):
     if p is not None and bridge.host_alive(p):
         die(f"a claude rc (pid {p.pid}, session {p.session_id}) is already "
             f"serving {d}; `crc adopt` keeps it instead")
+    if a.resume or a.channel:
+        a.interactive = True        # only a terminal session resumes or loads channels
+    if d in entries and (a.resume or a.channel):
+        die(f"{d} is already kept; `crc rm` it first")
+    bad = [c for c in a.channel if not keeper.CHANNEL_ENTRY.match(c)]
+    if bad:
+        die(f"not a channel: {', '.join(bad)}; use server:NAME or plugin:NAME@MARKETPLACE")
+    if a.accept_channels and not a.channel:
+        die("--accept-channels needs --channel")
+    if a.resume:
+        resume_from(d, a.resume)
     name = a.name or os.path.basename(d) or d
+    channels = list(dict.fromkeys(a.channel))
     if a.interactive:
-        argv = ["claude", "--remote-control", *([a.name] if a.name else []), *a.args]
+        argv = (["claude", *(["--resume", a.resume] if a.resume else []), "--remote-control",
+                 *([a.name] if a.name else []), *a.args]
+                + ([keeper.CHANNEL_FLAG, *channels] if channels else []))
         confirm = keeper.interactive_started
     else:
         argv = keeper.rc_argv(a.args, a.name)
         confirm = keeper.rc_started(d)
-    wid, r, err = keeper.start(d, name, argv, confirm, trust=a.trust)
+    wid, r, err = keeper.start(d, name, argv, confirm, trust=a.trust,
+                               channels=channels if a.accept_channels else None)
     if err is not None:
         left = (f"\n(window {wid} left open in `crc attach` for a closer look)"
                 if tmuxctl.get(wid) is not None else "")
@@ -78,12 +96,41 @@ def cmd_new(a):
     if a.interactive:
         e.update(kind="interactive", session_id=r.bridge_session_id,
                  transcript_id=r.transcript_id)
+        if channels:
+            e.update(channels=channels, accept_channels=a.accept_channels,
+                     channel_check=keeper.check_channels(d, r.pid, channels))
     else:
         e.update(kind="rc", session_id=r.session_id, environment_id=r.environment_id,
                  sessions=[])
     entries[d] = e
     keeper.save(entries)
     print(f"keeping {d}\n  session {e['session_id']}\n  window  {wid} (crc attach)")
+    if a.resume:
+        print(f"  link    https://claude.ai/code/{e['session_id']} (a conversation "
+              f"born on a claude rc host gets a new one the first time it is resumed)")
+    for line in channel_lines(e):
+        print(f"  {line}")
+
+
+def resume_from(d, tid):
+    """Make conversation tid resumable in d: `claude --resume` looks it up under
+    d's project key. Refuses one that is open in a running process, since two
+    processes would then write the same conversation."""
+    found = bridge.find_transcript(tid)
+    if not found:
+        die(f"no conversation {tid} under {bridge.claude_dir()}/projects "
+            f"(the id is the transcript's file name, a UUID)")
+    for s in bridge.live_sessions():
+        if s.transcript_id == tid:
+            die(f"conversation {tid} is open in pid {s.pid} ({s.cwd}); exit it, or "
+                f"archive its claude.ai session, first")
+    here = os.path.join(bridge.claude_dir(), "projects", bridge.project_key(d))
+    if here in found:
+        return
+    if len(found) > 1:
+        die(f"conversation {tid} is under several folders: " + ", ".join(found))
+    for n in bridge.copy_transcript(tid, found[0], d):
+        print(f"copied {n} from {found[0]}")
 
 
 def cmd_adopt(a):
@@ -583,6 +630,13 @@ def main():
                    help="a terminal session with remote control, not a claude rc host")
     s.add_argument("--trust", action="store_true",
                    help="if Claude Code asks whether to trust the folder, answer yes")
+    s.add_argument("--resume", metavar="ID",
+                   help="continue this conversation (implies -i); copied to DIR if "
+                        "it lives under another folder. Its claude.ai link changes")
+    s.add_argument("--channel", action="append", default=[], metavar="CH",
+                   help="load this development channel (implies -i; repeatable)")
+    s.add_argument("--accept-channels", action="store_true",
+                   help="let crc answer the development-channel warning (see crc channel)")
     s.set_defaults(fn=cmd_new)
 
     s = sub.add_parser("adopt", help="keep a session already running here")

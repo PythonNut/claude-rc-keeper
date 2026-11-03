@@ -631,18 +631,47 @@ def process_age(pid):
         return None
 
 
-def revive_reason(directory, entry):
-    """Why the timer should start this kept host again, or None."""
+def disconnected(entry, window, server, live, net_ok=True, clock=time.time):
+    """For a terminal host running in our window: how long claude.ai has
+    seen it disconnected while the server was reachable, or None if it is
+    connected (or that is unknown).
+
+    A safety net: a terminal session keeps retrying (2.1.286 came back by
+    itself, about 3 minutes after an 11-minute outage ended). If one did stop,
+    its session file would still name the remote session, so only the
+    server's connection_status shows it. Time spent offline does not count,
+    so a session that is about to reconnect is not restarted. Records when it
+    was first seen down in entry["disconnected_at"], across timer runs.
+    """
+    s = server.get(bridge.canonical(entry["session_id"])) if server else None
+    if (not net_ok or s is None or s.connection != "disconnected"
+            or s.status == "archived"):
+        entry.pop("disconnected_at", None)
+        return None
+    # Never cut off a turn in progress, whatever the server thinks.
+    if any(x.pid == window.pid and x.status not in ("", "idle") for x in live):
+        return None
+    since = entry.setdefault("disconnected_at", clock())
+    return clock() - since
+
+
+def revive_reason(directory, entry, server=None, live=(), net_ok=True):
+    """Why the timer should start this kept host again, or None. server maps
+    canonical session ids to the server's list (None if unavailable)."""
     if entry.get("last_status") in NEEDS_PERSON:
         return None
     action, detail = state_of(directory, entry)
     if action in (LAUNCH, RELEASE):
         return "it is not running"
+    w = tmuxctl.window_for(directory)
     if action == STUCK and detail == UNREGISTERED:
-        w = tmuxctl.window_for(directory)
         age = process_age(w.pid) if w else None
         if age is not None and age >= REVIVE_GRACE:
             return f"it has not been connected for {int(age // 60)}+ minutes"
+    if action == RUNNING and kind(entry) == "interactive" and w is not None:
+        gone = disconnected(entry, w, server, live, net_ok)
+        if gone is not None and gone >= REVIVE_GRACE:
+            return f"claude.ai has not reached it for {int(gone // 60)}+ minutes"
     return None
 
 
@@ -650,15 +679,27 @@ def revive_all(entries, log=print):
     """Start again every kept host that stopped or lost the server, if the
     server is reachable now; otherwise leave them for the next try. Returns
     True if any entry changed."""
+    server = None
+    if any(kind(e) == "interactive" for e in entries.values()):
+        listed = fetch_server_sessions()
+        server = {s.id: s for s in listed} if listed is not None else None
+    live = bridge.live_sessions()
+    net_ok = wait_network(timeout=10)
+    before = {d: e.get("disconnected_at") for d, e in entries.items()}
     due = [(d, e, why) for d, e in sorted(entries.items())
-           if os.path.isdir(d) for why in [revive_reason(d, e)] if why]
+           if os.path.isdir(d) for why in [revive_reason(d, e, server, live, net_ok)] if why]
+    changed = any(e.get("disconnected_at") != before[d] for d, e in entries.items())
     if not due:
-        return False
-    if not wait_network(timeout=10):
+        return changed
+    if not net_ok:
         log(f"api.anthropic.com unreachable; {len(due)} host(s) left for the next try")
-        return False
+        return changed
     for d, e, why in due:
         log(f"{d}: starting it again: {why}")
+        w = tmuxctl.window_for(d)
+        if w is not None and not w.dead:
+            tmuxctl.kill(w.id)          # alive but unreachable: replace it
+        e.pop("disconnected_at", None)
         restore_one(d, e, log)
     return True
 

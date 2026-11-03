@@ -162,6 +162,40 @@ def copy_project(old_dir, new_dir):
     return copied
 
 
+TRANSCRIPT_ID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+
+
+def find_transcript(transcript_id):
+    """The project dirs holding <id>.jsonl, the conversation `--resume` takes."""
+    if not TRANSCRIPT_ID.match(transcript_id):
+        return []
+    root = os.path.join(claude_dir(), "projects")
+    try:
+        keys = sorted(os.listdir(root))
+    except FileNotFoundError:
+        return []
+    return [os.path.join(root, k) for k in keys
+            if os.path.isfile(os.path.join(root, k, transcript_id + ".jsonl"))]
+
+
+def copy_transcript(transcript_id, src_project, new_dir):
+    """Copy one conversation (<id>.jsonl and its <id>/ dir, if any) to
+    new_dir's project key, never overwriting. Returns the names copied."""
+    dst = os.path.join(claude_dir(), "projects", project_key(new_dir))
+    os.makedirs(dst, exist_ok=True)
+    copied = []
+    for n in (transcript_id + ".jsonl", transcript_id):
+        s, t = os.path.join(src_project, n), os.path.join(dst, n)
+        if not os.path.lexists(s) or os.path.lexists(t):
+            continue
+        if os.path.isdir(s) and not os.path.islink(s):
+            shutil.copytree(s, t, symlinks=True)
+        else:
+            shutil.copy2(s, t, follow_symlinks=False)
+        copied.append(n)
+    return copied
+
+
 def parse_proc_start(stat_line):
     """Field 22 of /proc/<pid>/stat: start time in clock ticks since boot.
 
@@ -211,6 +245,7 @@ class LiveSession(NamedTuple):
     bridge_session_id: str      # its remote-control session, or "" if none
     entrypoint: str             # "cli" for a terminal session; rc children are "sdk-cli"
     name: str = ""              # the client's local name for it
+    status: str = ""            # "idle" when waiting for input; "" if not recorded
 
 
 def parse_session(text):
@@ -219,7 +254,8 @@ def parse_session(text):
         return (LiveSession(int(d["pid"]), str(d["sessionId"]), str(d["cwd"]),
                             str(d.get("bridgeSessionId") or ""),
                             str(d.get("entrypoint") or ""),
-                            str(d.get("name") or "")),
+                            str(d.get("name") or ""),
+                            str(d.get("status") or "")),
                 str(d["procStart"]))
     except (ValueError, KeyError, TypeError):
         return None
@@ -357,6 +393,7 @@ class ServerSession(NamedTuple):
     environment_id: str
     status: str             # idle, running, archived, ...
     title: str
+    connection: str = ""    # connected, or disconnected: nothing serves it now
 
 
 # The beta the client sends when it lists sessions (for --teleport).
@@ -370,7 +407,8 @@ def parse_server_sessions(body):
             out.append(ServerSession(canonical(str(d["id"])),
                                      str(d.get("environment_id") or ""),
                                      str(d.get("session_status") or ""),
-                                     str(d.get("title") or "")))
+                                     str(d.get("title") or ""),
+                                     str(d.get("connection_status") or "")))
         except (KeyError, TypeError):
             continue
     return out

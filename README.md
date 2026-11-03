@@ -87,12 +87,15 @@ refused: exit it first.
 
 ## Staying connected
 
-Claude Code gives up on the server after 10 minutes without it (a hardcoded
-limit in 2.1.286): `claude rc` exits, and a terminal session turns remote
-control off. The sync timer runs `crc sync --revive`, which keeps trying
-instead. Every 3 minutes, if api.anthropic.com is reachable, it starts again
-any kept host that has stopped, and any whose window has been up for 10
-minutes without registering with the server. It leaves alone a host at a
+`claude rc` gives up on the server after 10 minutes without it (a hardcoded
+limit in 2.1.286) and exits. The sync timer runs `crc sync --revive`, which
+keeps trying instead. Every 3 minutes, if api.anthropic.com is reachable, it
+starts again any kept host that has stopped, and any whose window has been up
+for 10 minutes without registering with the server. A terminal session
+keeps retrying by itself (it came back about 3 minutes after an 11-minute
+outage); as a safety net, one that claude.ai reports disconnected for 10
+minutes while the server is reachable, and that is not in the middle of a
+turn, is restarted too. It leaves alone a host at a
 question a person has to answer (trust, a new MCP server, an unaccepted
 channel warning), and one whose last start failed for that reason, until
 `crc restore` is run by hand. To stop a host for good, `crc rm` it; one
@@ -108,7 +111,15 @@ terminal (`-i`) host can load one: `claude rc` rejects the
     crc channel DIR server:NAME --accept  ...and answers the launch warning
     crc channel DIR --clear               no channels
 
-`server:NAME` must be a server in DIR's `.mcp.json`; `--mcp-config` servers
+`crc new -i DIR --channel server:NAME [--accept-channels]` sets the same at
+the first start, and `crc new DIR --resume ID` continues an existing
+conversation there as a terminal host, copying its transcript to DIR's
+project key if it lives under another folder. It refuses a conversation that
+is open in a running process. A conversation born on a `claude rc` host gets
+a new claude.ai link the first time it is resumed this way.
+
+`server:NAME` must be a server in DIR's `.mcp.json` (found by walking up from
+DIR, so a parent folder's servers load too); `--mcp-config` servers
 don't resolve (2.1.286). Pre-approve it with `"enabledMcpjsonServers":
 ["NAME"]` in DIR's `.claude/settings.local.json`, or the first start stops at
 the new-MCP-server prompt. Every launch shows a full-screen warning. Without
@@ -142,6 +153,8 @@ Without it, restore runs when you log in.
 
     crc new [DIR] [--name N] [-- FLAGS]  start `claude rc` in DIR and keep it
     crc new -i [DIR] [--name N]          same, as a terminal `claude --remote-control`
+    crc new DIR --resume ID [--channel CH] [--accept-channels]
+                                         a terminal host continuing conversation ID
     crc adopt [DIR] [--pid N]            keep a session already running there
     crc ls [--json]                      state of each kept folder; --json adds
                                          session titles, status and pids
