@@ -1,9 +1,11 @@
 # Records the sessions on each kept rc host, from the server's session list
-# and the hosts' child processes, so a restore brings them all back.
+# and the hosts' child processes, so a restore brings them all back. Then
+# starts again any kept host that stopped or lost the server, which Claude
+# Code itself gives up on after 10 minutes.
 [Unit]
-Description=Record sessions on kept Claude Code remote-control hosts
+Description=Record sessions on kept Claude Code hosts, and restart any that stopped
 
 [Service]
 Type=oneshot
 Environment="PATH=@PATH@"
-ExecStart=@BINDIR@/crc sync
+ExecStart=@BINDIR@/crc sync --revive

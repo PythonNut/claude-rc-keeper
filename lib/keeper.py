@@ -20,6 +20,8 @@ One entry per folder. Two kinds:
 `plan` is the whole restore policy as a pure function, so it can be tested
 without tmux, processes, or the network.
 """
+import contextlib
+import fcntl
 import json
 import os
 import re
@@ -44,6 +46,17 @@ NOT_TRUSTED = "Workspace not trusted"
 # `claude rc` in a git repo with no --spawn asks this, and waits forever.
 SPAWN_PROMPT = "Spawn mode for this project"
 SPAWN_DEFAULT = "--spawn=same-dir"
+# Development channels: MCP servers that push messages into a conversation.
+# A terminal session can load them; `claude rc` rejects the flag. Each launch
+# shows a warning whose default answer accepts it.
+CHANNEL_FLAG = "--dangerously-load-development-channels"
+CHANNEL_WARNING = "WARNING: Loading development channels"
+CHANNEL_ACCEPT = re.compile(r"❯\s*1\.\s*I am using this for local development")
+CHANNEL_LIST = re.compile(r"^\s*Channels: (.+?)\s*$", re.M)
+CHANNEL_ENTRY = re.compile(r"^(server:[\w.-]+|plugin:[\w.-]+@[\w.-]+)$")
+# A .mcp.json server the folder has not approved yet; it can be pre-approved
+# with enabledMcpjsonServers in the folder's .claude/settings.local.json.
+MCP_CONSENT = "New MCP server found in this project"
 # The last line of a screen waiting on a question: "[y/N]", "Choose [1/2] ...".
 PROMPT_LINE = re.compile(r"\[\w+(?:/\w+)+\][^\[\]]{0,40}$")
 
@@ -63,6 +76,21 @@ def load():
             return json.load(f).get("sessions", {})
     except FileNotFoundError:
         return {}
+
+
+@contextlib.contextmanager
+def locked(block=True):
+    """Hold crc's lock while starting or stopping hosts, so the timer never
+    races a boot restore or a crc command. Yields False if block is False and
+    another crc holds it."""
+    os.makedirs(state_dir(), mode=0o700, exist_ok=True)
+    with open(os.path.join(state_dir(), "lock"), "w") as f:
+        try:
+            fcntl.flock(f, fcntl.LOCK_EX | (0 if block else fcntl.LOCK_NB))
+        except BlockingIOError:
+            yield False
+            return
+        yield True
 
 
 def save(entries):
@@ -90,6 +118,15 @@ ELSEWHERE = "elsewhere"      # its host is alive outside crc; leave it alone
 OCCUPIED = "occupied"        # a different live host serves the folder
 RELEASE = "release"          # a dead host's registration blocks it; release, then launch
 STUCK = "stuck"              # our window is up but never registered (at a prompt?)
+UNREGISTERED = "up but not registered with the server"
+
+# Claude Code stops trying to reach the server after 10 minutes without it
+# (claude rc exits; a terminal session turns remote control off). The sync
+# timer starts such hosts again once the server is reachable, and does not
+# touch a window younger than this, which may still be starting or retrying.
+REVIVE_GRACE = 600
+# Last outcomes a person has to fix first; the timer would only repeat them.
+NEEDS_PERSON = ("untrusted", "stuck")
 LAUNCH = "launch"            # nothing in the way
 
 
@@ -165,6 +202,11 @@ def waiting_at(screen):
         return "Claude Code's trust prompt"
     if SPAWN_PROMPT in screen:
         return "claude rc's spawn-mode prompt"
+    if CHANNEL_WARNING in screen:
+        return "the development-channel warning"
+    if MCP_CONSENT in screen:
+        return ("the new-MCP-server prompt (pre-approve the server with "
+                "enabledMcpjsonServers in the folder's .claude/settings.local.json)")
     if lines and PROMPT_LINE.search(lines[-1]):
         return f"a prompt: {lines[-1]}"
     return None
@@ -182,7 +224,7 @@ def stuck(directory, entry, window):
     elif rc_started(directory)(window) is not None:
         return None
     q = waiting_at(tmuxctl.capture(window.id, lines=20))
-    return f"waiting at {q}" if q else "up but not registered with the server"
+    return f"waiting at {q}" if q else UNREGISTERED
 
 
 def unstick(directory, entry, log, dry_run=False):
@@ -270,7 +312,8 @@ def answer_trust(window_id, screen):
         tmuxctl.tmux("send-keys", "-t", window_id, "y", "Enter", check=False)
 
 
-def start(directory, name, argv, confirm, timeout=60, trust=False):
+def start(directory, name, argv, confirm, timeout=60, trust=False, channels=None,
+          log=print):
     """Launch argv in a crc window and wait until confirm(window) says it is up.
 
     Returns (window_id, result, error), where result is whatever confirm
@@ -279,16 +322,130 @@ def start(directory, name, argv, confirm, timeout=60, trust=False):
     the launch fails at once rather than waiting out the timeout. Where
     `claude rc` refuses outright instead of asking, trust=True accepts the
     prompt an interactive `claude` still shows, then launches again.
+
+    channels, if given, are the development channels crc may accept the
+    warning for: it answers only when the warning lists exactly those.
+    Otherwise the window is left at the warning, for someone to answer.
     """
-    wid, r, err = launch_and_wait(directory, name, argv, confirm, timeout, trust)
+    wid, r, err = launch_and_wait(directory, name, argv, confirm, timeout, trust,
+                                  channels, log)
     if err is not None and trust and NOT_TRUSTED in err:
         err = pretrust(directory, name)
         if err is None:
-            wid, r, err = launch_and_wait(directory, name, argv, confirm, timeout, trust)
+            wid, r, err = launch_and_wait(directory, name, argv, confirm, timeout, trust,
+                                          channels, log)
     return wid, r, err
 
 
-def launch_and_wait(directory, name, argv, confirm, timeout, trust):
+def channels_listed(screen):
+    """The channels a development-channel warning names."""
+    m = CHANNEL_LIST.search(screen)
+    return set(m.group(1).split(", ")) if m else set()
+
+
+def answer_channels(directory, wid, screen, channels, state, log):
+    """Deal with the development-channel warning on screen. Returns an error
+    to give up with, or None to keep waiting. state remembers, across calls,
+    when the warning was first seen and when it was answered."""
+    listed = channels_listed(screen)
+    if channels is None:
+        why = "crc answers it only for hosts set with `crc channel DIR ... --accept`"
+    elif listed != set(channels):
+        why = (f"it lists {', '.join(sorted(listed)) or 'nothing crc can read'}, "
+               f"but crc may accept only {', '.join(channels)}")
+    elif not CHANNEL_ACCEPT.search(screen):
+        why = "its first option is not the one crc knows how to accept"
+    else:
+        now_ = time.monotonic()
+        if "answered" not in state:
+            state.setdefault("seen", now_)
+            if now_ - state["seen"] >= TRUST_DELAY:     # see TRUST_DELAY
+                tmuxctl.tmux("send-keys", "-t", wid, "Enter", check=False)
+                state["answered"] = now_
+                log(f"{directory}: accepted the development-channel warning "
+                    f"for {', '.join(channels)}")
+            return None
+        if now_ - state["answered"] < 5:
+            return None
+        why = "crc accepted it, but it stayed"
+    # Left open: whoever set the channels can answer it in `crc attach`.
+    return (f"stuck: claude is waiting at its development-channel warning; {why}. "
+            f"Answer it in `crc attach`, or `crc rm` the host")
+
+
+def mcp_servers(directory):
+    """The folder's .mcp.json servers, {name: config}."""
+    try:
+        with open(os.path.join(directory, ".mcp.json")) as f:
+            servers = json.load(f).get("mcpServers", {})
+        return servers if isinstance(servers, dict) else {}
+    except (OSError, ValueError, AttributeError):
+        return {}
+
+
+def descendants(pid):
+    """argv of every process under pid."""
+    kids, argv = {}, {}
+    for d in os.listdir("/proc"):
+        if d.isdigit():
+            pp = bridge.parent_pid(int(d))
+            if pp is not None:
+                kids.setdefault(pp, []).append(int(d))
+    out, todo = [], list(kids.get(pid, []))
+    while todo:
+        p = todo.pop()
+        try:
+            with open(f"/proc/{p}/cmdline", "rb") as f:
+                argv[p] = [a.decode(errors="replace") for a in f.read().split(b"\0") if a]
+        except OSError:
+            continue
+        out.append(argv[p])
+        todo.extend(kids.get(p, []))
+    return out
+
+
+def check_channels(directory, pid, channels, timeout=20):
+    """Whether each channel's server came up under the session.
+
+    The notice that names registered channels is drawn under the banner,
+    and a resumed conversation scrolls it away before anything can read it.
+    What can be seen is the server process: a server: channel is running if
+    the command its .mcp.json entry names is a child of the session. Only
+    the folder's .mcp.json is consulted; plugin: channels are not checked.
+    Returns {"at", "registered", "missing": {channel: reason}, "unchecked"}.
+    """
+    servers = mcp_servers(directory)
+    want, missing, unchecked = {}, {}, []
+    for ch in channels:
+        kind_, _, name = ch.partition(":")
+        if kind_ != "server":
+            unchecked.append(ch)
+        elif not isinstance(servers.get(name), dict) or not servers[name].get("command"):
+            missing[ch] = f"no {name!r} server with a command in {directory}/.mcp.json"
+        else:
+            # The command, and the script it runs if args name one: an
+            # interpreter alone (python3, bun) would match any server.
+            args = servers[name].get("args") or []
+            want[ch] = [os.path.basename(servers[name]["command"])] + \
+                ([os.path.basename(str(args[0]))] if args else [])
+    found = set()
+    deadline = time.monotonic() + timeout
+    while want.keys() - found and time.monotonic() < deadline:
+        procs = descendants(pid)
+        for ch, names in want.items():
+            if any(all(n in [os.path.basename(a) for a in argv[:3]] for n in names)
+                   for argv in procs):
+                found.add(ch)
+        if want.keys() - found:
+            time.sleep(1)
+    for ch in want.keys() - found:
+        missing[ch] = f"its server ({servers[ch.partition(':')[2]]['command']}) is not running under the session"
+    return {"at": now(), "registered": [c for c in channels if c in found],
+            "missing": missing, "unchecked": unchecked}
+
+
+def launch_and_wait(directory, name, argv, confirm, timeout, trust, channels=None,
+                    log=print):
     tmuxctl.ensure_session()
     old = tmuxctl.window_for(directory)
     if old is not None:
@@ -296,6 +453,7 @@ def launch_and_wait(directory, name, argv, confirm, timeout, trust):
     wid = tmuxctl.launch(directory, name, argv)
     deadline = time.monotonic() + timeout
     answered = seen = waiting = None
+    warned = {}
     while time.monotonic() < deadline:
         time.sleep(0.5)
         w = tmuxctl.get(wid)
@@ -311,6 +469,11 @@ def launch_and_wait(directory, name, argv, confirm, timeout, trust):
         if r is not None:
             return wid, r, None
         screen = tmuxctl.capture(wid, lines=20)
+        if CHANNEL_WARNING in screen:
+            err = answer_channels(directory, wid, screen, channels, warned, log)
+            if err is not None:
+                return wid, None, f"{screen}\n{err}"
+            continue
         if TRUST_PROMPT not in screen:
             q = waiting_at(screen)
             if q is None:
@@ -322,7 +485,7 @@ def launch_and_wait(directory, name, argv, confirm, timeout, trust):
             if time.monotonic() - waiting < 5:
                 continue
             tmuxctl.kill(wid)
-            return wid, None, f"stuck: claude stopped at {q}, which crc cannot answer:\n{screen}"
+            return wid, None, f"{screen}\nstuck: claude stopped at {q}, which crc cannot answer"
         if trust and answered is None:
             # The client ignores an answer that comes too soon after the
             # question (keys typed ahead of it), so let it sit a moment.
@@ -380,8 +543,10 @@ def resume_argv(entry):
     pointer we write first, and stays multi-session, which --session-id would
     not."""
     if kind(entry) == "interactive":
+        # The channel flag takes a list, so it goes last.
+        channels = entry.get("channels") or []
         return ["claude", "--resume", entry["transcript_id"], "--remote-control",
-                *entry.get("args", [])]
+                *entry.get("args", []), *([CHANNEL_FLAG, *channels] if channels else [])]
     return rc_argv(entry.get("args", []))
 
 
@@ -455,6 +620,49 @@ def sync_all(entries, log=print):
     return changed
 
 
+def process_age(pid):
+    """Seconds since pid started, or None."""
+    start = bridge.proc_start(pid)
+    try:
+        with open("/proc/uptime") as f:
+            up = float(f.read().split()[0])
+        return up - int(start) / os.sysconf("SC_CLK_TCK")
+    except (OSError, ValueError, TypeError):
+        return None
+
+
+def revive_reason(directory, entry):
+    """Why the timer should start this kept host again, or None."""
+    if entry.get("last_status") in NEEDS_PERSON:
+        return None
+    action, detail = state_of(directory, entry)
+    if action in (LAUNCH, RELEASE):
+        return "it is not running"
+    if action == STUCK and detail == UNREGISTERED:
+        w = tmuxctl.window_for(directory)
+        age = process_age(w.pid) if w else None
+        if age is not None and age >= REVIVE_GRACE:
+            return f"it has not been connected for {int(age // 60)}+ minutes"
+    return None
+
+
+def revive_all(entries, log=print):
+    """Start again every kept host that stopped or lost the server, if the
+    server is reachable now; otherwise leave them for the next try. Returns
+    True if any entry changed."""
+    due = [(d, e, why) for d, e in sorted(entries.items())
+           if os.path.isdir(d) for why in [revive_reason(d, e)] if why]
+    if not due:
+        return False
+    if not wait_network(timeout=10):
+        log(f"api.anthropic.com unreachable; {len(due)} host(s) left for the next try")
+        return False
+    for d, e, why in due:
+        log(f"{d}: starting it again: {why}")
+        restore_one(d, e, log)
+    return True
+
+
 def requeue(directory, entry, log):
     """Hand every remembered session but the first back to the restored host.
     The first is adopted by the client itself, from the pointer."""
@@ -486,7 +694,7 @@ def finish(directory, entry, wid, err, log):
         return True
     status = ("blocked" if ALREADY_SERVED in err else
               "untrusted" if "untrusted: " in err else
-              "stuck" if err.startswith("stuck: ") else "failed")
+              "stuck" if re.search(r"^stuck: ", err, re.M) else "failed")
     entry["last_status"], entry["last_error"] = status, err.strip()[-2000:]
     log(f"{directory}: {status}:\n{err}")
     return False
@@ -502,6 +710,9 @@ def restore_interactive(directory, entry, log, dry_run=False, trust=False):
             log(f"{directory}: running outside crc (pid {detail}); would leave it alone")
         else:
             log(f"{directory}: would run {' '.join(resume_argv(entry))}")
+            if entry.get("channels") and entry.get("accept_channels"):
+                log(f"{directory}: would accept the development-channel warning "
+                    f"for {', '.join(entry['channels'])}")
         return True
     entry["updated"] = now()
     if action == RUNNING:
@@ -512,12 +723,21 @@ def restore_interactive(directory, entry, log, dry_run=False, trust=False):
         entry["last_status"], entry["last_error"] = "elsewhere", None
         return True
     log(f"{directory}: resuming conversation {entry['transcript_id']}")
+    channels = entry.get("channels") or []
     wid, s, err = start(directory, entry.get("name") or os.path.basename(directory),
-                        resume_argv(entry), interactive_started, trust=trust)
+                        resume_argv(entry), interactive_started, trust=trust,
+                        channels=channels if entry.get("accept_channels") else None,
+                        log=log)
     if err is None and s.bridge_session_id != entry["session_id"]:
         log(f"{directory}: came back as {s.bridge_session_id}, not "
             f"{entry['session_id']}; the claude.ai link changed")
         entry["session_id"] = s.bridge_session_id
+    if err is None and channels:
+        entry["channel_check"] = c = check_channels(directory, s.pid, channels)
+        for ch, why in c["missing"].items():
+            log(f"{directory}: channel {ch} is not up: {why}")
+        if c["registered"]:
+            log(f"{directory}: channel servers running: {', '.join(c['registered'])}")
     return finish(directory, entry, wid, err, log)
 
 

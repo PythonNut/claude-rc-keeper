@@ -11,6 +11,8 @@
     crc attach                          attach to the tmux session hosting them
     crc rm DIR [--keep-registration]    stop keeping DIR, stop it, release it
     crc move OLD NEW [--trust]          carry a kept session to a moved folder
+    crc channel DIR [CH ...] [--accept | --no-accept | --clear]
+                                        development channels for a terminal host
     crc release [DIR] [--force]         release a dead host's stale registration
     crc stale                           list stale registrations in every folder
     crc doctor                          check what restore depends on
@@ -145,6 +147,8 @@ def cmd_ls(a):
         if keeper.kind(e) == "rc" and e.get("synced_from") != "server":
             print(f"{'':20} sessions so far seen only from local processes; "
                   f"idle ones may be missing until `crc sync` reaches the server")
+        for line in channel_lines(e):
+            print(f"{'':20} {line}")
         if action not in (keeper.RUNNING, keeper.ELSEWHERE) and e.get("last_error"):
             last = e["last_error"].splitlines()[-1]
             print(f"{'':20} last attempt: {e.get('last_status')}: {last}")
@@ -176,6 +180,9 @@ def ls_json(entries):
                     "transcript_id": e.get("transcript_id"),
                     "sessions": sessions,
                     "synced_from": e.get("synced_from"),
+                    "channels": e.get("channels") or [],
+                    "accept_channels": bool(e.get("accept_channels")),
+                    "channel_check": e.get("channel_check"),
                     "last_status": e.get("last_status"),
                     "last_error": e.get("last_error")})
     json.dump(out, sys.stdout, indent=2)
@@ -183,10 +190,23 @@ def ls_json(entries):
 
 
 def cmd_sync(a):
-    """One call to the server's session list, plus /proc and ~/.claude."""
-    entries = keeper.load()
-    if keeper.sync_all(entries):
-        keeper.save(entries)
+    """One call to the server's session list, plus /proc and ~/.claude. With
+    --revive (the timer), also start again hosts that stopped or lost the
+    server, which Claude Code itself gives up on after 10 minutes."""
+    if not a.revive:
+        entries = keeper.load()
+        if keeper.sync_all(entries):
+            keeper.save(entries)
+        return
+    with keeper.locked(block=False) as got:
+        if not got:
+            print("another crc is changing hosts; skipping this round")
+            return
+        entries = keeper.load()
+        changed = keeper.sync_all(entries)
+        changed |= keeper.revive_all(entries)
+        if changed:
+            keeper.save(entries)
 
 
 def cmd_restore(a):
@@ -353,6 +373,68 @@ def cmd_move(a):
         print(f"moved {old} -> {new}")
 
 
+def channel_lines(e):
+    """How a host's development channels stand, for ls and channel."""
+    ch = e.get("channels") or []
+    if not ch:
+        return []
+    out = [f"channels {', '.join(ch)}; the warning is answered "
+           + ("by crc" if e.get("accept_channels") else "by hand (`crc attach`)")]
+    c = e.get("channel_check")
+    if c is None or set(c["registered"]) | set(c["missing"]) | set(c.get("unchecked", [])) != set(ch):
+        out.append("not checked: crc has not started it with these channels yet")
+    elif c["missing"]:
+        out.append(f"NOT up at the launch of {c['at']}: "
+                   + "; ".join(f"{k}: {v}" for k, v in c["missing"].items()))
+    elif c["registered"]:
+        out.append(f"server running at the launch of {c['at']}"
+                   + (f" (not checked: {', '.join(c['unchecked'])})" if c.get("unchecked") else ""))
+    else:
+        out.append("not checked: crc can check only server: channels")
+    return out
+
+
+def cmd_channel(a):
+    """Development channels are MCP servers that push messages into the
+    conversation. Only a terminal (-i) host can load them: `claude rc`
+    rejects the flag. Changes apply from the host's next start by crc."""
+    d = folder(a.dir)
+    entries = keeper.load()
+    e = entries.get(d)
+    if e is None:
+        die(f"{d} is not kept")
+    if a.clear:
+        for k in ("channels", "accept_channels", "channel_check"):
+            e.pop(k, None)
+    if a.channels:
+        bad = [c for c in a.channels if not keeper.CHANNEL_ENTRY.match(c)]
+        if bad:
+            die(f"not a channel: {', '.join(bad)}; use server:NAME (a server in the "
+                f"folder's .mcp.json) or plugin:NAME@MARKETPLACE")
+        if keeper.kind(e) != "interactive":
+            die(f"{d} is an rc host, and `claude rc` rejects "
+                f"{keeper.CHANNEL_FLAG}; only a terminal host (crc new -i, or an "
+                f"adopted `claude --remote-control`) can load channels")
+        new = list(dict.fromkeys(a.channels))
+        if new != e.get("channels"):
+            # Consent to answer the warning covers the channels it was given for.
+            if e.get("accept_channels") and a.accept is None:
+                print("crc: channels changed, so crc no longer answers the warning; "
+                      "pass --accept to have it answer for these", file=sys.stderr)
+            e["channels"], e["accept_channels"] = new, False
+            e.pop("channel_check", None)
+    if a.accept is not None:
+        if not e.get("channels"):
+            die(f"{d} has no channels; name them first")
+        e["accept_channels"] = a.accept
+    keeper.save(entries)
+    lines = channel_lines(e) or ["no channels"]
+    print(f"{d}\n  " + "\n  ".join(lines))
+    if a.channels or a.clear or a.accept is not None:
+        print("  applies from its next start by crc; a running host keeps what it "
+              "started with")
+
+
 def cmd_release(a):
     d = folder(a.dir)
     p = bridge.read_pointer(d)
@@ -482,6 +564,10 @@ def cmd_doctor(a):
                   f"look, or `crc restore` to start it again")
         elif action not in (keeper.RUNNING, keeper.ELSEWHERE) and "untrusted: " in last[0]:
             check(f"{d} trusted by Claude Code", False, last[0].split("untrusted: ", 1)[1])
+        c = e.get("channel_check")
+        if e.get("channels") and c is not None:
+            check(f"{d} channel servers running at its last launch", not c["missing"],
+                  "; ".join(f"{k}: {v}" for k, v in c["missing"].items()))
     return 0 if ok else 1
 
 
@@ -508,7 +594,10 @@ def main():
     s.add_argument("--json", action="store_true",
                    help="machine-readable, with session titles and pids")
     s.set_defaults(fn=cmd_ls)
-    sub.add_parser("sync", help="record sessions opened on kept hosts").set_defaults(fn=cmd_sync)
+    s = sub.add_parser("sync", help="record sessions opened on kept hosts")
+    s.add_argument("--revive", action="store_true",
+                   help="also start again hosts that stopped or lost the server (the timer)")
+    s.set_defaults(fn=cmd_sync)
 
     s = sub.add_parser("restore", help="bring back every kept session")
     s.add_argument("--no-wait", action="store_true", help="skip waiting for the network")
@@ -531,6 +620,19 @@ def main():
                    help="if Claude Code asks whether to trust the folder, answer yes")
     s.set_defaults(fn=cmd_move)
 
+    s = sub.add_parser("channel", help="development channels for a terminal host")
+    s.add_argument("dir")
+    s.add_argument("channels", nargs="*", metavar="CH",
+                   help="server:NAME or plugin:NAME@MARKETPLACE; replaces the list")
+    g = s.add_mutually_exclusive_group()
+    g.add_argument("--accept", action="store_true", default=None,
+                   help="let crc answer the development-channel warning, only "
+                        "when it lists exactly these channels")
+    g.add_argument("--no-accept", dest="accept", action="store_false",
+                   help="leave the warning for you to answer in `crc attach`")
+    g.add_argument("--clear", action="store_true", help="drop all channels")
+    s.set_defaults(fn=cmd_channel)
+
     s = sub.add_parser("release", help="release a dead host's stale registration")
     s.add_argument("dir", nargs="?")
     s.add_argument("--force", action="store_true")
@@ -552,6 +654,12 @@ def main():
     if extra and a.cmd != "new":
         ap.error("only `crc new` takes extra claude rc flags after --")
     a.args = extra
+    if (a.cmd in ("new", "adopt", "move", "rm", "restore", "channel")
+            or a.cmd == "sync" and not a.revive) and not getattr(a, "dry_run", False):
+        # These start, stop or change hosts, or rewrite the registry; the
+        # timer skips a round rather than race them.
+        with keeper.locked():
+            sys.exit(a.fn(a) or 0)
     sys.exit(a.fn(a) or 0)
 
 

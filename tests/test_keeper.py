@@ -365,6 +365,161 @@ class Prompts(unittest.TestCase):
         self.assertEqual(e["last_status"], "stuck")
 
 
+class Channels(unittest.TestCase):
+    """crc answers the development-channel warning only for the channels it
+    was told to, and checks they came up."""
+
+    WARNING = ("WARNING: Loading development channels\n"
+               "Channels: server:handback\n"
+               "  ❯ 1. I am using this for local development\n    2. Exit\n")
+
+    def test_resume_argv_puts_the_list_flag_last(self):
+        e = {"kind": "interactive", "transcript_id": "t", "args": ["--model", "x"],
+             "channels": ["server:a", "server:b"]}
+        self.assertEqual(keeper.resume_argv(e)[-5:],
+                         ["--model", "x", keeper.CHANNEL_FLAG, "server:a", "server:b"])
+        del e["channels"]
+        self.assertNotIn(keeper.CHANNEL_FLAG, keeper.resume_argv(e))
+
+    def test_entries(self):
+        for ok in ("server:handback", "plugin:fakechat@claude-plugins-official"):
+            self.assertTrue(keeper.CHANNEL_ENTRY.match(ok), ok)
+        for bad in ("server:", "server:a b", "--model", "plugin:x", "server:a;rm"):
+            self.assertFalse(keeper.CHANNEL_ENTRY.match(bad), bad)
+
+    def test_listed(self):
+        self.assertEqual(keeper.channels_listed("Channels: server:a, server:b\n"),
+                         {"server:a", "server:b"})
+        self.assertIn("development-channel", keeper.waiting_at(self.WARNING))
+        self.assertIn("enabledMcpjsonServers",
+                      keeper.waiting_at("New MCP server found in this project: x"))
+
+    def _answer(self, channels, screen=None):
+        sent, saved = [], (tmuxctl.tmux, keeper.TRUST_DELAY)
+        tmuxctl.tmux = lambda *a, **k: sent.append(a)
+        keeper.TRUST_DELAY = 0
+        try:
+            state, logs = {}, []
+            errs = [keeper.answer_channels("/d", "@1", screen or self.WARNING, channels,
+                                           state, logs.append) for _ in range(2)]
+            return errs, sent, logs
+        finally:
+            tmuxctl.tmux, keeper.TRUST_DELAY = saved
+
+    def test_not_opted_in_is_never_answered(self):
+        errs, sent, _ = self._answer(None)
+        self.assertEqual(sent, [])
+        self.assertTrue(errs[0].startswith("stuck: "))
+        self.assertIn("crc channel", errs[0])
+
+    def test_unexpected_channel_is_never_answered(self):
+        errs, sent, _ = self._answer(["server:other"])
+        self.assertEqual(sent, [])
+        self.assertIn("server:handback", errs[0])
+
+    def test_pinned_channels_are_answered_once_and_logged(self):
+        errs, sent, logs = self._answer(["server:handback"])
+        self.assertEqual(errs, [None, None])
+        self.assertEqual(sent, [("send-keys", "-t", "@1", "Enter")])
+        self.assertIn("accepted the development-channel warning", logs[0])
+
+    def test_wrong_default_option_is_never_answered(self):
+        screen = self.WARNING.replace("❯ 1.", "  1.").replace("    2. Exit", "  ❯ 2. Exit")
+        errs, sent, _ = self._answer(["server:handback"], screen)
+        self.assertEqual(sent, [])
+        self.assertIsNotNone(errs[0])
+
+    def test_check_finds_the_server_process(self):
+        import subprocess
+        with tempfile.TemporaryDirectory() as d:
+            with open(os.path.join(d, ".mcp.json"), "w") as f:
+                json.dump({"mcpServers": {"up": {"command": "sleep"},
+                                          "down": {"command": "/no/such/server"},
+                                          "other": {"command": "sleep", "args": ["x.py"]}}}, f)
+            child = subprocess.Popen(["sleep", "30"])
+            try:
+                c = keeper.check_channels(d, os.getpid(), ["server:up", "server:down",
+                                                            "server:other", "server:absent",
+                                                            "plugin:p@m"], timeout=1)
+            finally:
+                child.kill()
+                child.wait()
+        self.assertEqual(c["registered"], ["server:up"])
+        self.assertIn("not running", c["missing"]["server:down"])
+        self.assertIn("not running", c["missing"]["server:other"])   # sleep, but not x.py
+        self.assertIn(".mcp.json", c["missing"]["server:absent"])
+        self.assertEqual(c["unchecked"], ["plugin:p@m"])
+
+
+class Revive(unittest.TestCase):
+    """The timer starts again what Claude Code gave up on, and nothing else."""
+
+    def _reason(self, entry, state, age=None):
+        saved = keeper.state_of, tmuxctl.window_for, keeper.process_age
+        keeper.state_of = lambda d, e: state
+        tmuxctl.window_for = lambda d: win()
+        keeper.process_age = lambda pid: age
+        try:
+            return keeper.revive_reason("/d", entry)
+        finally:
+            keeper.state_of, tmuxctl.window_for, keeper.process_age = saved
+
+    def test_stopped_hosts_are_revived(self):
+        self.assertIsNotNone(self._reason(dict(ENTRY), (keeper.LAUNCH, None)))
+        self.assertIsNotNone(self._reason(dict(ENTRY), (keeper.RELEASE, "env_X")))
+
+    def test_running_or_foreign_hosts_are_not(self):
+        for st in ((keeper.RUNNING, "@1"), (keeper.ELSEWHERE, 9), (keeper.OCCUPIED, 9)):
+            self.assertIsNone(self._reason(dict(ENTRY), st), st)
+
+    def test_unregistered_window_only_after_the_grace(self):
+        st = (keeper.STUCK, keeper.UNREGISTERED)
+        self.assertIsNone(self._reason(dict(ENTRY), st, age=60))
+        self.assertIn("minutes", self._reason(dict(ENTRY), st, age=keeper.REVIVE_GRACE + 1))
+
+    def test_window_at_a_question_is_left_for_a_person(self):
+        st = (keeper.STUCK, "waiting at the development-channel warning")
+        self.assertIsNone(self._reason(dict(ENTRY), st, age=10_000))
+
+    def test_last_outcome_a_person_must_fix_is_not_repeated(self):
+        for status in keeper.NEEDS_PERSON:
+            e = dict(ENTRY, last_status=status)
+            self.assertIsNone(self._reason(e, (keeper.LAUNCH, None)), status)
+
+    def test_no_network_leaves_them_for_the_next_try(self):
+        saved = keeper.revive_reason, keeper.wait_network, keeper.restore_one
+        started, logs = [], []
+        keeper.revive_reason = lambda d, e: "it is not running"
+        keeper.wait_network = lambda timeout: False
+        keeper.restore_one = lambda d, e, log: started.append(d)
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                self.assertFalse(keeper.revive_all({d: dict(ENTRY)}, logs.append))
+                self.assertEqual(started, [])
+                keeper.wait_network = lambda timeout: True
+                self.assertTrue(keeper.revive_all({d: dict(ENTRY)}, logs.append))
+                self.assertEqual(started, [d])
+        finally:
+            keeper.revive_reason, keeper.wait_network, keeper.restore_one = saved
+
+    def test_lock_is_exclusive(self):
+        with tempfile.TemporaryDirectory() as d:
+            old = os.environ.get("XDG_STATE_HOME")
+            os.environ["XDG_STATE_HOME"] = d
+            try:
+                with keeper.locked() as a:
+                    self.assertTrue(a)
+                    with keeper.locked(block=False) as b:
+                        self.assertFalse(b)
+                with keeper.locked(block=False) as c:
+                    self.assertTrue(c)
+            finally:
+                if old is None:
+                    del os.environ["XDG_STATE_HOME"]
+                else:
+                    os.environ["XDG_STATE_HOME"] = old
+
+
 if __name__ == "__main__":
     unittest.main()
 

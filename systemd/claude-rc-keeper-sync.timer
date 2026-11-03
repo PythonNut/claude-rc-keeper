@@ -1,5 +1,5 @@
 [Unit]
-Description=Record sessions on kept Claude Code remote-control hosts every few minutes
+Description=Record sessions on kept Claude Code hosts, and restart any that stopped, every few minutes
 
 [Timer]
 OnBootSec=5min

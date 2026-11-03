@@ -85,6 +85,40 @@ the environment back. A folder that isn't kept but has a pointer is moved too,
 with only the session the pointer names. A host still running outside crc is
 refused: exit it first.
 
+## Staying connected
+
+Claude Code gives up on the server after 10 minutes without it (a hardcoded
+limit in 2.1.286): `claude rc` exits, and a terminal session turns remote
+control off. The sync timer runs `crc sync --revive`, which keeps trying
+instead. Every 3 minutes, if api.anthropic.com is reachable, it starts again
+any kept host that has stopped, and any whose window has been up for 10
+minutes without registering with the server. It leaves alone a host at a
+question a person has to answer (trust, a new MCP server, an unaccepted
+channel warning), and one whose last start failed for that reason, until
+`crc restore` is run by hand. To stop a host for good, `crc rm` it; one
+stopped by hand in `crc attach` is started again by the next timer run.
+
+## Development channels
+
+A channel is an MCP server that pushes messages into a conversation. Only a
+terminal (`-i`) host can load one: `claude rc` rejects the
+`--dangerously-load-development-channels` flag. For such a host,
+
+    crc channel DIR server:NAME           crc starts it with that channel
+    crc channel DIR server:NAME --accept  ...and answers the launch warning
+    crc channel DIR --clear               no channels
+
+`server:NAME` must be a server in DIR's `.mcp.json`; `--mcp-config` servers
+don't resolve (2.1.286). Pre-approve it with `"enabledMcpjsonServers":
+["NAME"]` in DIR's `.claude/settings.local.json`, or the first start stops at
+the new-MCP-server prompt. Every launch shows a full-screen warning. Without
+`--accept`, crc leaves the host there (STUCK in `crc ls`) for you to answer in
+`crc attach`. With it, crc answers only a warning that lists exactly the
+stored channels, logs each acceptance, and forgets the consent when the list
+changes. After each start crc checks that each `server:` channel's command is
+running under the session, and `crc ls` and `crc doctor` report it. Changes
+apply from the host's next start.
+
 ## Install
 
     make install                      # to ~/.local; no root
@@ -111,7 +145,10 @@ Without it, restore runs when you log in.
     crc adopt [DIR] [--pid N]            keep a session already running there
     crc ls [--json]                      state of each kept folder; --json adds
                                          session titles, status and pids
-    crc sync                             record sessions opened on kept hosts
+    crc sync [--revive]                  record sessions opened on kept hosts;
+                                         --revive (the timer) also restarts
+                                         hosts that stopped or lost the server
+    crc channel DIR [CH...] [--accept]   development channels for a terminal host
     crc attach                           look at the sessions (the crc tmux server)
     crc rm DIR                           stop keeping DIR; stops it and releases it
     crc release [DIR]                    just the stale-registration fix
