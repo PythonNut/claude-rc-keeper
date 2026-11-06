@@ -15,6 +15,9 @@
     crc pause DIR... [--force]          stop kept hosts and keep them stopped,
     crc pause --under PATH [--force]    through the timer and reboots
     crc resume DIR... | --under PATH    start paused hosts again
+    crc poke DIR... | --under PATH [--dry-run]
+                                        re-queue sessions a live rc host has
+                                        stopped serving
     crc rm DIR [--keep-registration]    stop keeping DIR, stop it, release it
     crc move OLD NEW [--trust]          carry a kept session to a moved folder
     crc channel DIR [CH ...] [--accept | --no-accept | --clear]
@@ -228,6 +231,7 @@ def ls_json(entries):
             sessions.append({"id": sid,
                              "title": srv.title if srv else None,
                              "status": srv.status if srv else None,
+                             "connection": srv.connection or None if srv else None,
                              "pid": proc.pid if proc else None,
                              "local_name": proc.name or None if proc else None})
         out.append({"dir": d, "name": e.get("name"), "kind": keeper.kind(e),
@@ -474,6 +478,61 @@ def cmd_resume(a):
         del e["paused"]
         ok &= keeper.restore_one(d, e)
         keeper.save(entries)
+    return 0 if ok else 1
+
+
+def cmd_poke(a):
+    """Hand live rc hosts back the sessions they stopped serving (see
+    keeper.unserved), with the call restore uses; the host starts a child for
+    each. Only ever run by hand: crc does not re-queue on its own, so it
+    cannot loop on a session that keeps dying."""
+    entries = keeper.load()
+    ds = targets(a, entries)
+    server = keeper.fetch_server_sessions(lambda m: print(f"crc: {m}", file=sys.stderr))
+    if server is None:
+        die("only the server can say which sessions are disconnected; try again later")
+    live = bridge.live_sessions()
+    ok, poked = True, []
+    for d in ds:
+        e = entries[d]
+        if keeper.kind(e) != "rc":
+            print(f"{d}: a terminal host serves its one session itself; nothing to poke")
+            continue
+        p = bridge.read_pointer(d)
+        todo = keeper.unserved(e, p, p is not None and bridge.host_alive(p), server, live)
+        if todo is None:
+            if e.get("paused"):
+                print(f"{d}: paused; `crc resume` starts it with its sessions")
+            else:
+                print(f"{d}: its host is not running; `crc restore` starts it with "
+                      f"its sessions", file=sys.stderr)
+                ok = False
+            continue
+        if not todo:
+            print(f"{d}: every session is being served")
+        for sid in todo:
+            if a.dry_run:
+                print(f"{d}: would re-queue {sid}")
+                continue
+            try:
+                bridge.reconnect(e["environment_id"], sid)
+                print(f"{d}: re-queued {sid}")
+                poked.append((d, p.pid, sid))
+            except bridge.BridgeError as err:
+                print(f"{d}: could not re-queue {sid}: {err}", file=sys.stderr)
+                ok = False
+    deadline = time.monotonic() + 30
+    while poked and time.monotonic() < deadline:
+        time.sleep(2)
+        live = bridge.live_sessions()
+        for d, pid, sid in list(poked):
+            if sid in bridge.host_sessions(pid, live):
+                print(f"{d}: {sid} is served again")
+                poked.remove((d, pid, sid))
+    for d, pid, sid in poked:
+        print(f"{d}: {sid} was re-queued, but no child has it after 30s; "
+              f"`crc attach` to look", file=sys.stderr)
+        ok = False
     return 0 if ok else 1
 
 
@@ -803,6 +862,12 @@ def main():
             s.add_argument("--force", action="store_true",
                            help="stop a host even with a session mid-turn")
         s.set_defaults(fn=fn)
+
+    s = sub.add_parser("poke", help="re-queue sessions a live rc host stopped serving")
+    s.add_argument("dirs", nargs="*", metavar="DIR")
+    s.add_argument("--under", metavar="PATH", help="every kept folder at or below PATH")
+    s.add_argument("--dry-run", action="store_true", help="only show what it would re-queue")
+    s.set_defaults(fn=cmd_poke)
 
     s = sub.add_parser("rm", help="stop keeping a folder")
     s.add_argument("dir")

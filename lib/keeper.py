@@ -621,6 +621,26 @@ def sync_one(directory, entry, live=None, server=None):
     return added, dropped
 
 
+def unserved(entry, pointer, alive, server, live):
+    """Sessions a live kept rc host has stopped serving: the server shows them
+    disconnected and no child of the host has them. What `crc poke` re-queues.
+
+    A host whose children exit stays up -- on 2026-11-05 a failed token
+    refresh did that to every host on argon -- so nothing else notices. A
+    session nobody has opened since the host started looks the same (pending,
+    disconnected, no child); re-queuing it just starts its child early.
+    Returns None if the host is not up on the entry's environment, where a
+    re-queued session would have nothing to pick it up.
+    """
+    env = entry.get("environment_id")
+    if kind(entry) != "rc" or pointer is None or not alive or pointer.environment_id != env:
+        return None
+    served = set(bridge.host_sessions(pointer.pid, live))
+    return sorted(s.id for s in server
+                  if env and s.environment_id == env and s.status != "archived"
+                  and s.connection == "disconnected" and s.id not in served)
+
+
 def fetch_server_sessions(log=None):
     """The server's session list, or None (logged) if it cannot be had."""
     try:

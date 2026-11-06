@@ -632,6 +632,36 @@ class Pause(unittest.TestCase):
                 crc.targets(A, entries)
 
 
+class Poke(unittest.TestCase):
+    """crc poke re-queues only what a live host on our environment has stopped
+    serving."""
+
+    def _unserved(self, server, kids=(), pointer=ptr(), alive=True, entry=ENTRY):
+        live = [bridge.LiveSession(10 + i, "t", "/d", sid, "sdk-cli")
+                for i, sid in enumerate(kids)]
+        saved = bridge.parent_pid
+        bridge.parent_pid = lambda pid: 1234 if pid >= 10 else None
+        try:
+            return keeper.unserved(entry, pointer, alive, server, live)
+        finally:
+            bridge.parent_pid = saved
+
+    def test_disconnected_without_a_child_is_poked(self):
+        server = [bridge.ServerSession("session_KEEP", "env_KEEP", "idle", "", "disconnected"),
+                  bridge.ServerSession("session_TWO", "env_KEEP", "idle", "", "connected"),
+                  bridge.ServerSession("session_GONE", "env_KEEP", "archived", "", "disconnected"),
+                  bridge.ServerSession("session_ELSE", "env_X", "idle", "", "disconnected"),
+                  bridge.ServerSession("session_KID", "env_KEEP", "idle", "", "disconnected")]
+        self.assertEqual(self._unserved(server, kids=["session_KID"]), ["session_KEEP"])
+
+    def test_nothing_to_pick_it_up_is_never_poked(self):
+        server = [bridge.ServerSession("session_KEEP", "env_KEEP", "idle", "", "disconnected")]
+        self.assertIsNone(self._unserved(server, alive=False))
+        self.assertIsNone(self._unserved(server, pointer=None))
+        self.assertIsNone(self._unserved(server, pointer=ptr(env="env_X")))
+        self.assertIsNone(self._unserved(server, entry=IENTRY))
+
+
 if __name__ == "__main__":
     unittest.main()
 

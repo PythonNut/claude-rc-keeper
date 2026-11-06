@@ -98,7 +98,22 @@ minutes while the server is reachable, and that is not in the middle of a
 turn, is restarted too. It leaves alone a host at a
 question a person has to answer (trust, a new MCP server, an unaccepted
 channel warning), and one whose last start failed for that reason, until
-`crc restore` is run by hand. To stop a host for a while, `crc pause` it;
+`crc restore` is run by hand.
+
+Sessions can also drop while their host stays up: an rc host serves each
+one from a child process, and if the children exit (on 2026-11-05 a failed
+token refresh did that to every host on one machine), claude.ai shows the
+sessions idle and disconnected and nothing brings them back until someone
+messages them. `crc poke DIR...` (or `--under PATH`, `--dry-run`) re-queues
+every session on a live kept rc host's environment that the server shows
+disconnected and no child is serving, with the call restore uses; the host
+then starts a child for each, and poke waits up to 30 seconds to see it. A
+session nobody has opened since its host started looks the same and just
+gets its child early. crc never pokes on its own, so a session that keeps
+dying can't make it loop; `crc ls --json` gives each session's
+`connection`.
+
+To stop a host for a while, `crc pause` it;
 to stop it for good, `crc rm` it. One stopped by hand in `crc attach` is
 started again by the next timer run.
 
@@ -187,6 +202,8 @@ Without it, restore runs when you log in.
     crc pause DIR... [--force]           stop kept hosts and keep them stopped;
     crc pause --under PATH               --under: every kept folder below PATH
     crc resume DIR... | --under PATH     start paused hosts again
+    crc poke DIR... | --under PATH       re-queue sessions a live rc host has
+                                         stopped serving; --dry-run to look
     crc attach                           look at the sessions (the crc tmux server)
     crc rm DIR                           stop keeping DIR; stops it and releases it
     crc release [DIR]                    just the stale-registration fix
