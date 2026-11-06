@@ -5,11 +5,15 @@ plan() is the only place that decides to delete a server registration. The
 cases below are the ones where getting it wrong either deletes something live
 or deletes the environment the kept session is about to be resumed on.
 """
+import contextlib
+import importlib.util
+import io
 import json
 import os
 import sys
 import tempfile
 import unittest
+from importlib.machinery import SourceFileLoader
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, "..", "lib"))
@@ -551,6 +555,81 @@ class Revive(unittest.TestCase):
                     del os.environ["XDG_STATE_HOME"]
                 else:
                     os.environ["XDG_STATE_HOME"] = old
+
+
+class Pause(unittest.TestCase):
+    """A paused host stays stopped until crc resume, and pausing never cuts
+    off a turn unasked."""
+
+    def test_paused_hosts_are_never_revived(self):
+        e = dict(ENTRY, paused="2026-11-06T10:00:00-0800")
+        saved = keeper.state_of, tmuxctl.window_for, keeper.process_age
+        tmuxctl.window_for = lambda d: win()
+        keeper.process_age = lambda pid: 10_000
+        try:
+            for st in ((keeper.LAUNCH, None), (keeper.RELEASE, "env_X"),
+                       (keeper.STUCK, keeper.UNREGISTERED)):
+                keeper.state_of = lambda d, e, st=st: st
+                self.assertIsNone(keeper.revive_reason("/d", e), st)
+        finally:
+            keeper.state_of, tmuxctl.window_for, keeper.process_age = saved
+
+    def _state(self, entry, live=()):
+        saved = tmuxctl.window_for, bridge.live_sessions
+        tmuxctl.window_for = lambda d: None
+        bridge.live_sessions = lambda: list(live)
+        try:
+            return keeper.state_of("/d", entry)
+        finally:
+            tmuxctl.window_for, bridge.live_sessions = saved
+
+    def test_stopped_and_paused_shows_paused(self):
+        e = dict(IENTRY, paused="T")
+        self.assertEqual(self._state(e), (keeper.PAUSED, "T"))
+        self.assertEqual(self._state(dict(IENTRY)), (keeper.LAUNCH, None))
+
+    def test_paused_but_running_elsewhere_shows_running(self):
+        live = [bridge.LiveSession(77, IENTRY["transcript_id"], "/d", "session_RC", "cli")]
+        self.assertEqual(self._state(dict(IENTRY, paused="T"), live), (keeper.ELSEWHERE, 77))
+
+    def test_busy_terminal_session(self):
+        live = [bridge.LiveSession(1234, "t", "/d", "session_RC", "cli", "", "busy"),
+                bridge.LiveSession(99, "u", "/d", "session_X", "cli", "", "busy")]
+        self.assertEqual([s.pid for s in keeper.busy(IENTRY, win(), live)], [1234])
+        idle = [live[0]._replace(status="idle")]
+        self.assertEqual(keeper.busy(IENTRY, win(), idle), [])
+        self.assertEqual(keeper.busy(IENTRY, None, live), [])
+        self.assertEqual(keeper.busy(IENTRY, win(dead=True), live), [])
+
+    def test_busy_rc_children(self):
+        live = [bridge.LiveSession(10, "a", "/d", "session_A", "sdk-cli", "", "waiting"),
+                bridge.LiveSession(11, "b", "/d", "session_B", "sdk-cli", "", "idle"),
+                bridge.LiveSession(12, "c", "/e", "session_C", "sdk-cli", "", "busy")]
+        saved = bridge.parent_pid
+        bridge.parent_pid = lambda pid: {10: 1234, 11: 1234, 12: 555}.get(pid)
+        try:
+            self.assertEqual([s.pid for s in keeper.busy(ENTRY, win(), live)], [10])
+        finally:
+            bridge.parent_pid = saved
+
+    def test_targets_by_prefix(self):
+        path = os.path.join(HERE, "..", "bin", "crc")
+        spec = importlib.util.spec_from_loader("crc", SourceFileLoader("crc", path))
+        crc = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(crc)
+        entries = {"/mnt/tank/a": {}, "/mnt/tank/b/c": {}, "/mnt/tankette": {}, "/home/x": {}}
+
+        class A:
+            dirs, under = [], "/mnt/tank/"
+        self.assertEqual(crc.targets(A, entries), ["/mnt/tank/a", "/mnt/tank/b/c"])
+        A.under = "/"
+        self.assertEqual(len(crc.targets(A, entries)), 4)
+        A.dirs, A.under = ["/mnt/tank/a"], None
+        self.assertEqual(crc.targets(A, entries), ["/mnt/tank/a"])
+        for A.dirs, A.under in (([], "/srv"), (["/mnt/tank"], None), ([], None),
+                                (["/mnt/tank/a"], "/mnt")):
+            with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
+                crc.targets(A, entries)
 
 
 if __name__ == "__main__":

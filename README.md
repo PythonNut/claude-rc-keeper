@@ -98,8 +98,30 @@ minutes while the server is reachable, and that is not in the middle of a
 turn, is restarted too. It leaves alone a host at a
 question a person has to answer (trust, a new MCP server, an unaccepted
 channel warning), and one whose last start failed for that reason, until
-`crc restore` is run by hand. To stop a host for good, `crc rm` it; one
-stopped by hand in `crc attach` is started again by the next timer run.
+`crc restore` is run by hand. To stop a host for a while, `crc pause` it;
+to stop it for good, `crc rm` it. One stopped by hand in `crc attach` is
+started again by the next timer run.
+
+## Pausing
+
+    crc pause DIR...  |  crc pause --under PATH     stop them; keep them stopped
+    crc resume DIR... |  crc resume --under PATH    start them again
+
+`crc pause` stops kept hosts the way `crc rm` does (Ctrl-C an rc host,
+`/exit` a terminal one) but keeps their entries, environments and claude.ai
+links. The timer and the restore at boot skip a paused host, so it stays
+stopped across reboots, and `crc ls` shows it as paused. `--under PATH` takes
+every kept folder at or below PATH, e.g. all of them on a disk about to be
+unmounted. A host with a session mid-turn, or waiting on a permission answer,
+is left running and reported (exit status 1); wait and pause again, or pass
+`--force` to abandon the turn. Pause also reports any process from a stopped
+window that outlived it, and a host running outside crc, which it marks
+paused but does not stop.
+
+`crc resume` starts paused hosts the way restore does, so an rc host comes
+back on its environment with every session it was serving. A folder that is
+missing (unmounted) stays paused. `crc move` starts a paused host in its new
+folder, and `crc new` refuses a paused one.
 
 ## Development channels
 
@@ -162,6 +184,9 @@ Without it, restore runs when you log in.
                                          --revive (the timer) also restarts
                                          hosts that stopped or lost the server
     crc channel DIR [CH...] [--accept]   development channels for a terminal host
+    crc pause DIR... [--force]           stop kept hosts and keep them stopped;
+    crc pause --under PATH               --under: every kept folder below PATH
+    crc resume DIR... | --under PATH     start paused hosts again
     crc attach                           look at the sessions (the crc tmux server)
     crc rm DIR                           stop keeping DIR; stops it and releases it
     crc release [DIR]                    just the stale-registration fix

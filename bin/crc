@@ -12,6 +12,9 @@
     crc sync                            record sessions opened on kept hosts (timer)
     crc restore [--dry-run]             bring back every kept session (boot)
     crc attach                          attach to the tmux session hosting them
+    crc pause DIR... [--force]          stop kept hosts and keep them stopped,
+    crc pause --under PATH [--force]    through the timer and reboots
+    crc resume DIR... | --under PATH    start paused hosts again
     crc rm DIR [--keep-registration]    stop keeping DIR, stop it, release it
     crc move OLD NEW [--trust]          carry a kept session to a moved folder
     crc channel DIR [CH ...] [--accept | --no-accept | --clear]
@@ -60,6 +63,8 @@ def cmd_new(a):
     w = tmuxctl.window_for(d)
     if d in entries and w is not None and not w.dead:
         die(f"{d} is already kept and running; `crc attach` to see it")
+    if d in entries and entries[d].get("paused"):
+        die(f"{d} is kept but paused; `crc resume {d}` starts it again")
     p = bridge.read_pointer(d)
     if p is not None and bridge.host_alive(p):
         die(f"a claude rc (pid {p.pid}, session {p.session_id}) is already "
@@ -175,6 +180,7 @@ STATE_TEXT = {keeper.RUNNING: "running ({})",
               keeper.OCCUPIED: "blocked: another live host (pid {})",
               keeper.RELEASE: "stopped; stale registration {} to release",
               keeper.STUCK: "STUCK, not serving: window {}",
+              keeper.PAUSED: "paused since {} (`crc resume` starts it)",
               keeper.LAUNCH: "stopped"}
 
 
@@ -196,6 +202,9 @@ def cmd_ls(a):
                   f"idle ones may be missing until `crc sync` reaches the server")
         for line in channel_lines(e):
             print(f"{'':20} {line}")
+        if e.get("paused") and action != keeper.PAUSED:
+            print(f"{'':20} paused since {e['paused']}, but running anyway; crc will "
+                  f"not start it again once it stops")
         if action not in (keeper.RUNNING, keeper.ELSEWHERE) and e.get("last_error"):
             last = e["last_error"].splitlines()[-1]
             print(f"{'':20} last attempt: {e.get('last_status')}: {last}")
@@ -227,6 +236,7 @@ def ls_json(entries):
                     "transcript_id": e.get("transcript_id"),
                     "sessions": sessions,
                     "synced_from": e.get("synced_from"),
+                    "paused": e.get("paused"),
                     "channels": e.get("channels") or [],
                     "accept_channels": bool(e.get("accept_channels")),
                     "channel_check": e.get("channel_check"),
@@ -265,6 +275,9 @@ def cmd_restore(a):
         # which shows what a real restore would re-queue.
         keeper.sync_all(entries, log=lambda m: print(f"(sync) {m}"))
         for d, e in sorted(entries.items()):
+            if e.get("paused"):
+                print(f"{d}: paused since {e['paused']}; would skip")
+                continue
             if not os.path.isdir(d):
                 print(f"{d}: folder missing (unmounted?); would skip")
                 continue
@@ -278,6 +291,9 @@ def cmd_restore(a):
         keeper.save(entries)
     ok = True
     for d, e in sorted(entries.items()):
+        if e.get("paused"):
+            print(f"{d}: paused since {e['paused']}; skipped (`crc resume` starts it)")
+            continue
         if not os.path.isdir(d):
             print(f"{d}: folder missing (unmounted?); skipped")
             e["last_status"], e["last_error"] = "failed", "folder missing"
@@ -302,7 +318,10 @@ def cmd_attach(a):
 
 def stop_window(w, interactive=False):
     """Exit the way it would in a terminal: Ctrl-C for an rc host; for a
-    terminal session, Escape (abandon any turn in progress) then /exit."""
+    terminal session, Escape (abandon any turn in progress) then /exit.
+    Returns what is left of its process tree afterwards, as (pid, program)."""
+    tree = {} if w.dead else {p: bridge.proc_start(p)
+                              for p in [w.pid, *keeper.descendant_pids(w.pid)]}
     if interactive:
         tmuxctl.tmux("send-keys", "-t", w.id, "Escape", check=False)
         time.sleep(0.5)
@@ -315,6 +334,15 @@ def stop_window(w, interactive=False):
         if cur is None or cur.dead:
             break
     tmuxctl.kill(w.id)
+    for _ in range(10):
+        # A pid counts only while it is the same process: same start time,
+        # and not a zombie (which has no cmdline and holds no folder).
+        left = [(p, os.path.basename(argv[0])) for p, t in tree.items()
+                for argv in [keeper.cmdline(p)] if argv and bridge.proc_start(p) == t]
+        if not left:
+            break
+        time.sleep(0.5)
+    return left
 
 
 def cmd_rm(a):
@@ -345,6 +373,108 @@ def cmd_rm(a):
             print(f"released {env}")
         except bridge.BridgeError as err:
             print(f"could not release {env}: {err}", file=sys.stderr)
+
+
+def targets(a, entries):
+    """The kept folders pause and resume act on: the DIRs named, or with
+    --under every kept folder at or below PATH."""
+    if bool(a.dirs) == bool(a.under):
+        die("name the folders, or give --under PATH for every kept folder below it")
+    if a.under:
+        top = folder(a.under).rstrip("/")
+        ds = [d for d in sorted(entries) if d == top or d.startswith(top + "/")]
+        if not ds:
+            die(f"nothing kept at or under {top or '/'}")
+        return ds
+    ds = list(dict.fromkeys(folder(x) for x in a.dirs))
+    missing = [d for d in ds if d not in entries]
+    if missing:
+        die("not kept: " + ", ".join(missing))
+    return ds
+
+
+def cmd_pause(a):
+    """Stop kept hosts on purpose, and keep them stopped -- the timer and
+    restore at boot skip them -- until `crc resume`. Each keeps its entry,
+    its environment and its claude.ai links: the stop is the same Ctrl-C or
+    /exit `crc rm` uses, and resuming is a restore. A host with a session
+    mid-turn is left running unless --force."""
+    entries = keeper.load()
+    ds = targets(a, entries)
+    if any(keeper.kind(entries[d]) == "rc" for d in ds):
+        # Once an rc host is down only the server knows its idle sessions;
+        # record any opened since the timer last ran, so resume re-queues them.
+        if keeper.sync_all(entries):
+            keeper.save(entries)
+    live = bridge.live_sessions()
+    ok = True
+    for d in ds:
+        e = entries[d]
+        w = tmuxctl.window_for(d)
+        cut = keeper.busy(e, w, live)
+        what = ", ".join(f"{s.bridge_session_id or s.transcript_id} ({s.status})" for s in cut)
+        if cut and not a.force:
+            print(f"{d}: not paused: {what} mid-turn; wait for it, or --force to stop "
+                  f"it anyway, abandoning the turn", file=sys.stderr)
+            ok = False
+            continue
+        since = e.get("paused")
+        e["paused"] = since or keeper.now()
+        e["last_status"], e["last_error"] = "paused", None
+        e.pop("disconnected_at", None)
+        keeper.save(entries)
+        left = []
+        if w is not None:
+            if cut:
+                print(f"{d}: stopping mid-turn: {what}")
+            left = stop_window(w, keeper.kind(e) == "interactive")
+        action, detail = keeper.state_of(d, e)
+        if action == keeper.PAUSED:
+            print(f"{d}: " + (f"paused (window {w.id} stopped)" if w is not None and not w.dead
+                               else f"already paused since {since}" if since
+                               else "paused (it was not running)"))
+        elif action == keeper.ELSEWHERE:
+            print(f"{d}: paused, but its host runs outside crc (pid {detail}), and crc "
+                  f"stops only what it started; exit it yourself (Ctrl-C an rc host, "
+                  f"/exit a terminal session)", file=sys.stderr)
+            ok = False
+        elif action == keeper.OCCUPIED:
+            print(f"{d}: paused, but another claude rc (pid {detail}), not crc's, is "
+                  f"serving the folder", file=sys.stderr)
+            ok = False
+        else:
+            print(f"{d}: paused, but it is still {action} ({detail})", file=sys.stderr)
+            ok = False
+        if left:
+            print(f"{d}: still running from its window after the stop: "
+                  + ", ".join(f"pid {p} ({n})" for p, n in left), file=sys.stderr)
+            ok = False
+    return 0 if ok else 1
+
+
+def cmd_resume(a):
+    """Start paused hosts again, the way restore does: an rc host on its old
+    environment with every session it was serving, a terminal host on its
+    conversation. A folder that is missing (unmounted?) stays paused."""
+    entries = keeper.load()
+    ds = targets(a, entries)
+    todo, ok = [], True
+    for d in ds:
+        if not entries[d].get("paused"):
+            print(f"{d}: not paused; left as it is")
+        elif not os.path.isdir(d):
+            print(f"{d}: folder missing (unmounted?); still paused", file=sys.stderr)
+            ok = False
+        else:
+            todo.append(d)
+    if any(keeper.kind(entries[d]) == "rc" for d in todo) and keeper.sync_all(entries):
+        keeper.save(entries)
+    for d in todo:
+        e = entries[d]
+        del e["paused"]
+        ok &= keeper.restore_one(d, e)
+        keeper.save(entries)
+    return 0 if ok else 1
 
 
 def cmd_move(a):
@@ -395,6 +525,8 @@ def cmd_move(a):
     print(f"copied {len(copied)} conversation file(s) to {new}'s project")
     if e.get("name") == (os.path.basename(old) or old):
         e["name"] = os.path.basename(new) or new
+    if e.pop("paused", None):
+        print(f"{old} was paused; the move starts it in {new}")
     entries.pop(old, None)
     entries[new] = e
     keeper.save(entries)
@@ -661,6 +793,17 @@ def main():
 
     sub.add_parser("attach", help="attach to the crc tmux session").set_defaults(fn=cmd_attach)
 
+    for cmd, fn, text in (("pause", cmd_pause, "stop kept hosts, and keep them stopped"),
+                          ("resume", cmd_resume, "start paused hosts again")):
+        s = sub.add_parser(cmd, help=text)
+        s.add_argument("dirs", nargs="*", metavar="DIR")
+        s.add_argument("--under", metavar="PATH",
+                       help="every kept folder at or below PATH")
+        if cmd == "pause":
+            s.add_argument("--force", action="store_true",
+                           help="stop a host even with a session mid-turn")
+        s.set_defaults(fn=fn)
+
     s = sub.add_parser("rm", help="stop keeping a folder")
     s.add_argument("dir")
     s.add_argument("--keep-registration", action="store_true",
@@ -708,7 +851,7 @@ def main():
     if extra and a.cmd != "new":
         ap.error("only `crc new` takes extra claude rc flags after --")
     a.args = extra
-    if (a.cmd in ("new", "adopt", "move", "rm", "restore", "channel")
+    if (a.cmd in ("new", "adopt", "move", "rm", "restore", "channel", "pause", "resume")
             or a.cmd == "sync" and not a.revive) and not getattr(a, "dry_run", False):
         # These start, stop or change hosts, or rewrite the registry; the
         # timer skips a round rather than race them.

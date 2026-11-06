@@ -118,6 +118,7 @@ ELSEWHERE = "elsewhere"      # its host is alive outside crc; leave it alone
 OCCUPIED = "occupied"        # a different live host serves the folder
 RELEASE = "release"          # a dead host's registration blocks it; release, then launch
 STUCK = "stuck"              # our window is up but never registered (at a prompt?)
+PAUSED = "paused"            # stopped on purpose (crc pause); nothing starts it but crc resume
 UNREGISTERED = "up but not registered with the server"
 
 # Claude Code stops trying to reach the server after 10 minutes without it
@@ -250,16 +251,34 @@ def untrusted(directory, said=None):
 
 
 def state_of(directory, entry):
-    """(action, detail) for one kept folder, as things stand right now."""
+    """(action, detail) for one kept folder, as things stand right now. A
+    paused one that is somehow running anyway shows as running."""
     window = tmuxctl.window_for(directory)
     why = stuck(directory, entry, window)
     if why is not None:
         return STUCK, why
     if kind(entry) == "interactive":
-        return plan_interactive(entry, bridge.live_sessions(), window)
-    pointer = bridge.read_pointer(directory)
-    alive = pointer is not None and bridge.host_alive(pointer)
-    return plan(entry, pointer, alive, window)
+        action, detail = plan_interactive(entry, bridge.live_sessions(), window)
+    else:
+        pointer = bridge.read_pointer(directory)
+        alive = pointer is not None and bridge.host_alive(pointer)
+        action, detail = plan(entry, pointer, alive, window)
+    if entry.get("paused") and action in (LAUNCH, RELEASE):
+        return PAUSED, entry["paused"]
+    return action, detail
+
+
+def busy(entry, window, live):
+    """The sessions in a crc window that are mid-turn (or waiting on a
+    permission answer), which stopping the window would cut off: the
+    terminal session itself, or an rc host's children."""
+    if window is None or window.dead:
+        return []
+    if kind(entry) == "interactive":
+        mine = [s for s in live if s.pid == window.pid]
+    else:
+        mine = [s for s in live if bridge.parent_pid(s.pid) == window.pid]
+    return [s for s in mine if s.status not in ("", "idle")]
 
 
 def interactive_in(directory, live):
@@ -383,9 +402,9 @@ def mcp_servers(directory):
         return {}
 
 
-def descendants(pid):
-    """argv of every process under pid."""
-    kids, argv = {}, {}
+def descendant_pids(pid):
+    """Every process under pid."""
+    kids = {}
     for d in os.listdir("/proc"):
         if d.isdigit():
             pp = bridge.parent_pid(int(d))
@@ -394,14 +413,23 @@ def descendants(pid):
     out, todo = [], list(kids.get(pid, []))
     while todo:
         p = todo.pop()
-        try:
-            with open(f"/proc/{p}/cmdline", "rb") as f:
-                argv[p] = [a.decode(errors="replace") for a in f.read().split(b"\0") if a]
-        except OSError:
-            continue
-        out.append(argv[p])
+        out.append(p)
         todo.extend(kids.get(p, []))
     return out
+
+
+def cmdline(pid):
+    """argv of pid, or None if it is gone."""
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            return [a.decode(errors="replace") for a in f.read().split(b"\0") if a]
+    except OSError:
+        return None
+
+
+def descendants(pid):
+    """argv of every process under pid."""
+    return [a for a in map(cmdline, descendant_pids(pid)) if a is not None]
 
 
 def check_channels(directory, pid, channels, timeout=20):
@@ -658,7 +686,7 @@ def disconnected(entry, window, server, live, net_ok=True, clock=time.time):
 def revive_reason(directory, entry, server=None, live=(), net_ok=True):
     """Why the timer should start this kept host again, or None. server maps
     canonical session ids to the server's list (None if unavailable)."""
-    if entry.get("last_status") in NEEDS_PERSON:
+    if entry.get("paused") or entry.get("last_status") in NEEDS_PERSON:
         return None
     action, detail = state_of(directory, entry)
     if action in (LAUNCH, RELEASE):
