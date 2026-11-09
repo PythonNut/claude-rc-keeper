@@ -57,6 +57,18 @@ CHANNEL_ENTRY = re.compile(r"^(server:[\w.-]+|plugin:[\w.-]+@[\w.-]+)$")
 # A .mcp.json server the folder has not approved yet; it can be pre-approved
 # with enabledMcpjsonServers in the folder's .claude/settings.local.json.
 MCP_CONSENT = "New MCP server found in this project"
+# Where /exit can stop in a terminal session (2.1.319), drawn in place of the
+# input box. The drafts prompt: Enter opens a panel that sends them, Esc
+# deletes them, and closing the window leaves them queued (they expire after
+# 30 days). The background-work prompt: Enter stops the work and exits, Esc
+# stays. Matched on the screen's last lines only: the same words can be in
+# the conversation above.
+EXIT_DRAFTS = "/exit's unsent-feedback-drafts prompt"
+EXIT_BACKGROUND = "/exit's background-work prompt"
+DRAFTS_LINE = re.compile(r"You have \d+ unsent feedback drafts?")
+DRAFTS_HINT = "Enter to review & send · Esc to discard and exit"
+BACKGROUND_TITLE = "Background work is running"
+BACKGROUND_HINT = "Enter to confirm · Esc to cancel"
 # The last line of a screen waiting on a question: "[y/N]", "Choose [1/2] ...".
 PROMPT_LINE = re.compile(r"\[\w+(?:/\w+)+\][^\[\]]{0,40}$")
 
@@ -196,9 +208,21 @@ def move_check(old, new, entry, old_alive, new_kept, new_pointer, new_alive):
     return None
 
 
+def exit_prompt(screen):
+    """EXIT_DRAFTS or EXIT_BACKGROUND if /exit is waiting at one, else None."""
+    lines = [ln.strip() for ln in screen.splitlines() if ln.strip()]
+    if len(lines) >= 2 and DRAFTS_LINE.fullmatch(lines[-2]) and lines[-1] == DRAFTS_HINT:
+        return EXIT_DRAFTS
+    if lines and lines[-1] == BACKGROUND_HINT and BACKGROUND_TITLE in lines[-40:]:
+        return EXIT_BACKGROUND
+    return None
+
+
 def waiting_at(screen):
     """The question a pane is sitting at, or None."""
     lines = [ln.strip() for ln in screen.splitlines() if ln.strip()]
+    if exit_prompt(screen):
+        return exit_prompt(screen)
     if TRUST_PROMPT in screen or TRUST_MENU_YES in screen:
         return "Claude Code's trust prompt"
     if SPAWN_PROMPT in screen:
@@ -216,12 +240,14 @@ def waiting_at(screen):
 def stuck(directory, entry, window):
     """Why a live crc window is not serving, or None if it is (or is not live).
     A host waiting at a question is up but never registered, and nobody can
-    reach it from claude.ai."""
+    reach it from claude.ai; a terminal session stopped partway through
+    /exit is registered, but no longer reads messages."""
     if window is None or window.dead:
         return None
     if kind(entry) == "interactive":
         if interactive_started(window) is not None:
-            return None
+            q = exit_prompt(tmuxctl.capture(window.id, lines=40))
+            return f"waiting at {q}" if q else None
     elif rc_started(directory)(window) is not None:
         return None
     q = waiting_at(tmuxctl.capture(window.id, lines=20))

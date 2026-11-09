@@ -127,11 +127,21 @@ started again by the next timer run.
 links. The timer and the restore at boot skip a paused host, so it stays
 stopped across reboots, and `crc ls` shows it as paused. `--under PATH` takes
 every kept folder at or below PATH, e.g. all of them on a disk about to be
-unmounted. A host with a session mid-turn, or waiting on a permission answer,
-is left running and reported (exit status 1); wait and pause again, or pass
-`--force` to abandon the turn. Pause also reports any process from a stopped
-window that outlived it, and a host running outside crc, which it marks
-paused but does not stop.
+unmounted. A host with a session mid-turn, waiting on a permission answer,
+or running a shell command (in the background too), is left running and
+reported (exit status 1); so is a terminal session whose `/exit` asks about
+other background work. Wait and pause again, or pass `--force` to stop it
+anyway. Pause also reports any process from a stopped window that outlived
+it, and a host running outside crc, which it marks paused but does not stop.
+
+`/exit` in a terminal session with queued feedback drafts (ones the model
+wrote with its feedback tool; they stay on the machine) stops to ask: Enter
+to review and send them, Esc to delete them. crc answers neither: it closes
+the window there, which keeps them queued for the session's next `/exit`.
+That prompt comes before the background-work one, so with both, the window
+closes at the first and background work stops even without `--force`. A
+window left at either prompt shows as STUCK in `crc ls`; `crc restore`
+replaces it the same way, and the timer leaves it for you.
 
 `crc resume` starts paused hosts the way restore does, so an rc host comes
 back on its environment with every session it was serving. A folder that is

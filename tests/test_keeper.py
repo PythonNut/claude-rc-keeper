@@ -632,6 +632,59 @@ class Pause(unittest.TestCase):
                 crc.targets(A, entries)
 
 
+class ExitPrompts(unittest.TestCase):
+    """What /exit can stop at, as 2.1.319 draws it, and never a conversation
+    that merely quotes it."""
+
+    DRAFTS = """● done
+✻ Worked for 5s · done 10:18 PM · 1 shell still running
+▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔
+  You have 1 unsent feedback draft
+  Enter to review & send · Esc to discard and exit
+"""
+    BACKGROUND = """✻ Worked for 5s · done 10:18 PM · 1 shell still running
+▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔
+   Background work is running
+   The following will stop when you exit:
+   shell · sleep 900
+   ❯ 1. Exit and stop tasks
+     2. Move to background and exit
+     3. Stay
+   Enter to confirm · Esc to cancel
+"""
+    QUOTED = """● It stops at "You have 2 unsent feedback drafts" with
+  Enter to review & send · Esc to discard and exit
+  and the dialog Background work is running, Enter to confirm · Esc to cancel.
+────────────────────────────────
+❯
+────────────────────────────────
+  ⏵⏵ auto mode on · 1 shell · 1 feedback draft · ↓ to manage
+"""
+
+    def test_drawn_prompts(self):
+        self.assertEqual(keeper.exit_prompt(self.DRAFTS), keeper.EXIT_DRAFTS)
+        self.assertEqual(keeper.exit_prompt(self.DRAFTS.replace("1 unsent feedback draft",
+                                                                "3 unsent feedback drafts")),
+                         keeper.EXIT_DRAFTS)
+        self.assertEqual(keeper.exit_prompt(self.BACKGROUND), keeper.EXIT_BACKGROUND)
+        self.assertEqual(keeper.waiting_at(self.DRAFTS), keeper.EXIT_DRAFTS)
+
+    def test_quoted_in_the_conversation_is_not_a_prompt(self):
+        self.assertIsNone(keeper.exit_prompt(self.QUOTED))
+        self.assertIsNone(keeper.waiting_at(self.QUOTED))
+
+    def test_registered_terminal_session_at_exit_is_stuck(self):
+        saved = keeper.interactive_started, tmuxctl.capture
+        keeper.interactive_started = lambda w: object()
+        try:
+            for screen, want in ((self.DRAFTS, f"waiting at {keeper.EXIT_DRAFTS}"),
+                                 (self.QUOTED, None)):
+                tmuxctl.capture = lambda wid, lines=40, s=screen: s.strip()
+                self.assertEqual(keeper.stuck("/d", IENTRY, win()), want)
+        finally:
+            keeper.interactive_started, tmuxctl.capture = saved
+
+
 class Poke(unittest.TestCase):
     """crc poke re-queues only what a live host on our environment has stopped
     serving."""

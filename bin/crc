@@ -320,10 +320,16 @@ def cmd_attach(a):
                         f"={tmuxctl.SESSION}"], env)
 
 
-def stop_window(w, interactive=False):
+def stop_window(w, interactive=False, force=True):
     """Exit the way it would in a terminal: Ctrl-C for an rc host; for a
     terminal session, Escape (abandon any turn in progress) then /exit.
-    Returns what is left of its process tree afterwards, as (pid, program)."""
+
+    Where /exit asks about unsent feedback drafts, the window is closed
+    there, which keeps them; crc never sends or deletes them. Where it asks
+    about background work, force stops the work; otherwise crc answers Stay
+    and leaves the session running. Returns (what is left of its process
+    tree afterwards, as (pid, program); why it was left running, or None).
+    """
     tree = {} if w.dead else {p: bridge.proc_start(p)
                               for p in [w.pid, *keeper.descendant_pids(w.pid)]}
     if interactive:
@@ -337,6 +343,17 @@ def stop_window(w, interactive=False):
         cur = tmuxctl.get(w.id)
         if cur is None or cur.dead:
             break
+        q = keeper.exit_prompt(tmuxctl.capture(w.id, lines=40)) if interactive else None
+        if q == keeper.EXIT_DRAFTS:
+            print(f"{w.dir}: closed the window at {q}; the drafts stay queued, "
+                  f"unsent, for its next /exit")
+            break
+        if q == keeper.EXIT_BACKGROUND and not force:
+            tmuxctl.tmux("send-keys", "-t", w.id, "Escape", check=False)     # Stay
+            return [], "it has background work running, and /exit would stop it"
+        if q == keeper.EXIT_BACKGROUND:
+            print(f"{w.dir}: stopping its background work, as /exit asked")
+            break
     tmuxctl.kill(w.id)
     for _ in range(10):
         # A pid counts only while it is the same process: same start time,
@@ -346,7 +363,7 @@ def stop_window(w, interactive=False):
         if not left:
             break
         time.sleep(0.5)
-    return left
+    return left, None
 
 
 def cmd_rm(a):
@@ -397,6 +414,11 @@ def targets(a, entries):
     return ds
 
 
+# What a session's status says it is doing, for pause's refusals.
+BUSY_TEXT = {"busy": "mid-turn", "waiting": "waiting on a permission answer",
+             "shell": "running a shell command (perhaps in the background)"}
+
+
 def cmd_pause(a):
     """Stop kept hosts on purpose, and keep them stopped -- the timer and
     restore at boot skip them -- until `crc resume`. Each keeps its entry,
@@ -416,13 +438,15 @@ def cmd_pause(a):
         e = entries[d]
         w = tmuxctl.window_for(d)
         cut = keeper.busy(e, w, live)
-        what = ", ".join(f"{s.bridge_session_id or s.transcript_id} ({s.status})" for s in cut)
+        what = "; ".join(f"{s.bridge_session_id or s.transcript_id} is "
+                         f"{BUSY_TEXT.get(s.status, s.status)}" for s in cut)
         if cut and not a.force:
-            print(f"{d}: not paused: {what} mid-turn; wait for it, or --force to stop "
-                  f"it anyway, abandoning the turn", file=sys.stderr)
+            print(f"{d}: not paused: {what}; wait for it, or --force to stop it "
+                  f"anyway", file=sys.stderr)
             ok = False
             continue
         since = e.get("paused")
+        before = {k: e.get(k) for k in ("paused", "last_status", "last_error")}
         e["paused"] = since or keeper.now()
         e["last_status"], e["last_error"] = "paused", None
         e.pop("disconnected_at", None)
@@ -430,8 +454,17 @@ def cmd_pause(a):
         left = []
         if w is not None:
             if cut:
-                print(f"{d}: stopping mid-turn: {what}")
-            left = stop_window(w, keeper.kind(e) == "interactive")
+                print(f"{d}: stopping it anyway: {what}")
+            left, kept = stop_window(w, keeper.kind(e) == "interactive", force=a.force)
+            if kept:
+                e.update(before)
+                if before["paused"] is None:
+                    del e["paused"]
+                keeper.save(entries)
+                print(f"{d}: not paused: {kept}; wait for it, or --force to stop "
+                      f"it anyway", file=sys.stderr)
+                ok = False
+                continue
         action, detail = keeper.state_of(d, e)
         if action == keeper.PAUSED:
             print(f"{d}: " + (f"paused (window {w.id} stopped)" if w is not None and not w.dead
